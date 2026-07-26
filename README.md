@@ -26,6 +26,8 @@ ETH, SOL, spot execution, inverse contracts, cross margin, hedge mode, options a
 - [`CONTRACTS.md`](CONTRACTS.md) — implementable schemas, units, invariants, artifacts and audit records.
 - [`METHODOLOGY.md`](METHODOLOGY.md) — exact feature, signal, allocation, sizing, cost and performance formulas.
 - [`OPERATIONS.md`](OPERATIONS.md) — runtime state machines, SLOs, security, incident handling, promotion and rollback.
+- [`ROADMAP.md`](ROADMAP.md) — fachliche Reihenfolge für Standalone-Strategien, Exit-Optimierung, Regime-Evidenz, L2 und spätere lernende Allokatoren.
+- [`MLFLOW.md`](MLFLOW.md) — normative Regeln für Experimente, Runs, Metriken, Metadaten, Artefakte, Model Registry, Promotion und Rollback.
 - [`crypto-history-loader/DATASETS.md`](https://github.com/SergejSchweizer/crypto-history-loader/blob/main/DATASETS.md) — upstream Gold dataset definitions.
 
 ## Production V1
@@ -176,16 +178,46 @@ A decision uses only closed M1 buckets. Historical entry simulation starts at th
 Production V1:
 - diagonal Gaussian HMM
 - deterministic probability-weighted allocator
+- standalone-calibrated and frozen strategy-specific exit profiles
 
 Challengers:
 - full-covariance Gaussian HMM
 - duration-aware HMM
 - regularised supervised allocator
+- small discrete regime-dependent exit-profile mapping
 
 Research only:
 - contextual bandit
 - reinforcement learning
 ```
+
+## Evidence and experiment order
+
+Economic evidence is established in stages:
+
+```text
+standalone Strategy Experts with nested exit optimisation
+→ frozen strategy-specific exit profiles
+→ No-Regime baseline versus Regime Candidate
+→ optional regime-dependent discrete exit profiles
+→ optional L2 microstructure overlay
+→ optional learned allocator
+```
+
+The core comparisons are:
+
+```text
+Regime Candidate - No-Regime Baseline
+= value of regime weighting
+
+Regime-dependent exits - fixed exits
+= additional value of regime-conditioned exits
+
+L2 overlay - no-L2 common-window baseline
+= additional microstructure value
+```
+
+MLflow records the experiment design, dataset lineage, parameters, statistical and economic metrics, artifacts and immutable model versions. Promotion remains governed by project-specific statistical, economic, shadow, paper, canary and manual approval gates.
 
 ## Deployment path
 
@@ -199,4 +231,4 @@ offline research
 → restricted production
 ```
 
-Promotion is always manual. The BTC-perpetual instrument specification, model, scaler, affinity matrix, strategy configuration, risk configuration, timing policy, cost model, code and dependencies are promoted and rolled back as one compatible artifact set.
+Promotion is always manual. The BTC-perpetual instrument specification, model, scaler, affinity matrix, strategy configuration, exit-profile set, risk configuration, timing policy, cost model, code and dependencies are promoted and rolled back as one compatible artifact set.
