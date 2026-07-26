@@ -1,6 +1,12 @@
 # Methodology
 
-This document defines the exact Production V1 strategy-signal and performance calculations. Implementations must reproduce these formulas and conventions.
+This document defines the exact Production V1 calculations.
+
+```text
+methodology_version = 1.0.0
+```
+
+Implementations must reproduce these formulas and conventions.
 
 ## 1. Numerical conventions
 
@@ -9,7 +15,7 @@ all log returns use natural logarithms
 all volatility values are decimal, not percent
 crypto annualisation uses 365 days and 8,760 hours
 risk-free rate = 0 in Production V1 research metrics
-feature_epsilon = configured positive constant
+feature_epsilon = 0.000000000001
 clamp(x, a, b) = min(max(x, a), b)
 sign(x) = -1 when x < 0, 0 when x = 0, +1 when x > 0
 ```
@@ -77,9 +83,6 @@ Fit ordinary least squares to the last 72 hourly log prices:
 
 ```text
 log_price_j = intercept + slope * j + residual_j
-```
-
-```text
 confidence = clamp(regression_R_squared, 0, 1)
 ```
 
@@ -146,10 +149,14 @@ directional_flow_confirmation = direction * flow_bias
 if direction = 0:
     confidence = 0
 else:
-    confidence = clamp(directional_flow_confirmation / flow_strength_scale, 0, 1)
+    confidence = clamp(
+        directional_flow_confirmation / flow_strength_scale,
+        0,
+        1
+    )
 ```
 
-Momentum confidence is therefore zero when trade flow materially opposes the momentum direction.
+Momentum confidence is zero when trade flow does not confirm the momentum direction.
 
 ### 4.6 Holding time
 
@@ -222,11 +229,116 @@ FAIL → direction = 0, strength = 0, confidence = 0
 
 No expert imputes missing trade volume, price, or return observations.
 
-## 7. Standalone expert simulation
+## 7. Deterministic allocator calculation
+
+### 7.1 Regime affinity
+
+For each strategy `s`:
+
+```text
+regime_affinity_s =
+    sum(current_probability_r * affinity_matrix[r][s])
+```
+
+### 7.2 Expert score
+
+```text
+expert_score_s = regime_affinity_s * strength_s * confidence_s
+signed_score_s = expert_score_s * direction_s
+```
+
+### 7.3 Direction evidence
+
+```text
+positive_evidence = sum(max(signed_score_s, 0))
+negative_evidence = sum(abs(min(signed_score_s, 0)))
+```
+
+```text
+if max(positive_evidence, negative_evidence) < minimum_consensus_evidence:
+    consensus_direction = FLAT
+else if min(positive_evidence, negative_evidence) > 0
+        and max(positive_evidence, negative_evidence)
+            / min(positive_evidence, negative_evidence)
+            < minimum_direction_dominance:
+    consensus_direction = FLAT
+else if positive_evidence > negative_evidence:
+    consensus_direction = LONG
+else:
+    consensus_direction = SHORT
+```
+
+For a spot instrument, `SHORT` becomes `FLAT`.
+
+### 7.4 Contribution weights and cash
+
+For every strategy:
+
+```text
+if strategy direction agrees with consensus direction:
+    active_score_s = expert_score_s
+else:
+    active_score_s = 0
+```
+
+The affinity matrix is constrained so the sum of expert scores cannot exceed `1 - minimum_cash_fraction`.
+
+```text
+strategy_contribution_weight_s = active_score_s
+cash_weight = 1 - sum(active_score_s)
+```
+
+No post-hoc renormalisation of active scores is allowed. Unused allocation remains cash.
+
+If consensus direction is `FLAT`:
+
+```text
+all strategy contribution weights = 0
+cash_weight = 1
+```
+
+### 7.5 Regime certainty
+
+```text
+regime_certainty =
+    clamp((maximum_probability - 1/3) / (2/3), 0, 1)
+```
+
+### 7.6 Volatility multiplier
+
+```text
+volatility_multiplier =
+    clamp(
+        target_volatility_annual
+        / max(realized_volatility_24h, volatility_floor),
+        0,
+        1
+    )
+```
+
+### 7.7 Proposed position
+
+```text
+global_risk_multiplier = regime_certainty * volatility_multiplier
+
+proposed_target_position_fraction =
+    direction_sign
+    * (1 - cash_weight)
+    * global_risk_multiplier
+```
+
+where `direction_sign` is `-1`, `0`, or `+1`.
+
+Bounds:
+
+```text
+SPOT:       clamp to [0, 1]
+PERPETUAL: clamp to [-1, 1]
+```
+
+## 8. Standalone expert simulation
 
 Each expert is evaluated as a standalone strategy before allocator evaluation.
-
-The standalone target position fraction is:
 
 ```text
 standalone_target_fraction = direction * strength * confidence
@@ -242,15 +354,15 @@ SPOT → clamp target to [0, 1]
 
 Entries, exits, costs, stops, take profit, and time stops use the same policies as the combined Production V1 pipeline.
 
-## 8. Equity and return series
+## 9. Equity and return series
 
-### 8.1 Equity
+### 9.1 Equity
 
 ```text
 equity_t = allocated_equity + cumulative_realized_pnl_t + unrealized_pnl_t
 ```
 
-### 8.2 Hourly net return
+### 9.2 Hourly net return
 
 ```text
 hourly_net_return_t = equity_t / equity_(t-1) - 1
@@ -258,15 +370,15 @@ hourly_net_return_t = equity_t / equity_(t-1) - 1
 
 The equity series includes fees, spread, slippage, funding, and realised stop/take-profit effects.
 
-## 9. Performance metrics
+## 10. Performance metrics
 
-### 9.1 Total net return
+### 10.1 Total net return
 
 ```text
 total_net_return = ending_equity / starting_equity - 1
 ```
 
-### 9.2 Annualised net return
+### 10.2 Annualised net return
 
 For `n_hours > 0`:
 
@@ -277,7 +389,7 @@ annualised_net_return =
 
 If ending equity is not positive, the candidate is rejected and annualised return is undefined.
 
-### 9.3 Drawdown
+### 10.3 Drawdown
 
 ```text
 running_peak_t = max(equity_0, ..., equity_t)
@@ -285,15 +397,15 @@ drawdown_t = equity_t / running_peak_t - 1
 maximum_drawdown_abs = abs(min(drawdown_t))
 ```
 
-### 9.4 Net Calmar ratio
+### 10.4 Net Calmar ratio
 
 ```text
 net_calmar = annualised_net_return / maximum_drawdown_abs
 ```
 
-If maximum drawdown is zero, Calmar is null. A non-positive annualised net return is non-promotable even if a ratio could be numerically produced.
+If maximum drawdown is zero, Calmar is null. A non-positive annualised net return is non-promotable.
 
-### 9.5 Net Sharpe ratio
+### 10.5 Net Sharpe ratio
 
 ```text
 net_sharpe =
@@ -304,7 +416,7 @@ net_sharpe =
 
 Sharpe is null when hourly return standard deviation is zero.
 
-### 9.6 Net Sortino ratio
+### 10.6 Net Sortino ratio
 
 ```text
 downside_returns_t = min(hourly_net_return_t, 0)
@@ -318,17 +430,18 @@ net_sortino =
 
 Sortino is null when downside deviation is zero.
 
-### 9.7 95% CVaR loss
+### 10.7 95% CVaR loss
 
 Sort hourly net returns ascending. Let `q_05` be the empirical 5th percentile.
 
 ```text
-cvar_95_loss_abs = abs(mean(hourly_net_return_t where hourly_net_return_t <= q_05))
+cvar_95_loss_abs =
+    abs(mean(hourly_net_return_t where hourly_net_return_t <= q_05))
 ```
 
 If the tail set is empty, CVaR is null and the candidate is rejected.
 
-### 9.8 Turnover
+### 10.8 Turnover
 
 For every approved target transition:
 
@@ -340,7 +453,7 @@ annualised_turnover =
     sum(turnover_fraction_t) * 8760 / n_hours
 ```
 
-### 9.9 Profitable-fold fraction
+### 10.9 Profitable-fold fraction
 
 ```text
 profitable_fold_fraction =
@@ -348,7 +461,7 @@ profitable_fold_fraction =
     / number_of_completed_outer_folds
 ```
 
-### 9.10 PnL concentration
+### 10.10 PnL concentration
 
 ```text
 fold_pnl_concentration =
@@ -358,35 +471,35 @@ fold_pnl_concentration =
 
 If there is no positive fold PnL, the candidate is rejected.
 
-## 10. Cost scenarios
+## 11. Cost scenarios
 
-### 10.1 Base
+### 11.1 Base
 
 Uses estimated historical or live-calibrated fees, spread, slippage, and funding.
 
-### 10.2 Elevated
+### 11.2 Elevated
 
 ```text
-spread = 1.5 × base spread
-slippage = 1.5 × base slippage
+spread = 1.5 * base spread
+slippage = 1.5 * base slippage
 fees = contractual fee schedule
 funding = observed funding
 ```
 
-### 10.3 Severe
+### 11.3 Severe
 
 ```text
-spread = 2.0 × base spread
-slippage = 2.0 × base slippage
+spread = 2.0 * base spread
+slippage = 2.0 * base slippage
 fees = taker fee for all fills
 funding cost = adverse observed funding for held direction
 ```
 
 A candidate fails cost stress when median outer-fold net return is not positive in both elevated and severe scenarios.
 
-## 11. Paired block bootstrap
+## 12. Paired block bootstrap
 
-Instrument comparison uses paired hourly return differences on timestamps available for both candidates.
+Instrument comparison uses paired hourly return series on timestamps available for both candidates.
 
 Default parameters:
 
@@ -397,9 +510,9 @@ confidence_level = 95%
 random_seed = versioned integer
 ```
 
-Each resample draws 24-hour contiguous blocks with replacement until it reaches the original sample length. The same block indices are used for spot and perpetual, preserving pairing.
+Each resample draws 24-hour contiguous blocks with replacement until it reaches the original sample length. The same block indices are used for spot and perpetual.
 
-For every resample, compute the complete Calmar metric for each instrument and the difference:
+For every resample, compute the complete path-dependent Calmar metric for each instrument:
 
 ```text
 calmar_difference = perpetual_net_calmar - spot_net_calmar
@@ -415,13 +528,11 @@ and
 median_completed_outer_fold_calmar_difference >= 0.10
 ```
 
-## 12. Parameter changes
+## 13. Parameter changes
 
-All default thresholds in this document belong to a versioned strategy or selection configuration.
+Changing any threshold, lookback, annualisation convention, metric definition, cost multiplier, bootstrap setting, or formula requires:
 
-Changing any threshold, lookback, annualisation convention, metric definition, cost multiplier, or bootstrap setting requires:
-
-- a new configuration version;
+- a new methodology or configuration version;
 - complete outer-fold reruns;
 - a new challenger artifact set;
 - shadow, paper, and canary validation before promotion.
