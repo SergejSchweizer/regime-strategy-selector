@@ -1,25 +1,29 @@
 # Contracts
 
-This document is normative for Production V1. Every field has one unit and one owner. Undefined fields, implicit defaults, cross-symbol payloads, and silent fallbacks are prohibited.
+This document is normative for Production V1. Undefined fields, implicit defaults, cross-symbol payloads, and silent fallbacks are prohibited.
 
-The architecture is defined in [`ARCHITECTURE.md`](ARCHITECTURE.md). Runtime requirements are defined in [`OPERATIONS.md`](OPERATIONS.md).
+Related documents:
+
+- [`ARCHITECTURE.md`](ARCHITECTURE.md)
+- [`METHODOLOGY.md`](METHODOLOGY.md)
+- [`OPERATIONS.md`](OPERATIONS.md)
 
 ## 1. Global rules
 
 ```text
 target_symbol ∈ {BTC, ETH, SOL}
 selected_instrument_type ∈ {SPOT, PERPETUAL}
-all timestamps use UTC
-all monetary values use the exchange settlement currency
+all timestamps are UTC
 all percentages are decimal fractions unless the field name ends in _bps
 one basis point = 0.0001
+methodology_version = 1.0.0 for Production V1
 ```
 
 Global invariants:
 
 ```text
 one deployment uses one target_symbol
-one deployment trades one selected instrument
+one deployment trades one instrument_id
 all payloads in a decision chain share deployment_id, target_symbol, and instrument_id
 source rows satisfy symbol == target_symbol
 cross-asset features are prohibited
@@ -28,7 +32,7 @@ feature inputs use closed source buckets only
 wrong-symbol or wrong-instrument input fails closed
 ```
 
-## 2. Common types and units
+## 2. Units
 
 ### 2.1 Position fraction
 
@@ -36,11 +40,9 @@ wrong-symbol or wrong-instrument input fails closed
 position_fraction = signed instrument notional / allocated_equity
 ```
 
-Bounds:
-
 ```text
-SPOT:       [0.00, 1.00]
-PERPETUAL: [-1.00, 1.00]
+SPOT bounds:       [0.00, 1.00]
+PERPETUAL bounds: [-1.00, 1.00]
 ```
 
 ### 2.2 Direction
@@ -51,23 +53,13 @@ FLAT  =  0
 LONG  = +1
 ```
 
-### 2.3 Notional
+### 2.3 Notional and quantity
 
-`notional` is absolute or signed settlement-currency exposure. It is never a base-asset quantity.
+`notional` is settlement-currency exposure. `quantity` is exchange base-asset or contract quantity. Analytical contracts produce notional; execution owns quantity conversion.
 
-### 2.4 Quantity
-
-`quantity` is base-asset or contract quantity and is owned by the execution system. Analytical contracts do not produce exchange quantity.
-
-### 2.5 Price
-
-Prices are settlement currency per base asset unless the exchange instrument explicitly defines a contract multiplier. Contract multiplier conversion is owned by execution.
-
-## 3. Deployment and capital contracts
+## 3. Capital, deployment, and operations
 
 ### 3.1 CapitalAllocation.v1
-
-Produced by an external account-level capital service.
 
 ```yaml
 contract: CapitalAllocation.v1
@@ -82,8 +74,6 @@ fields:
   valid_until: datetime_utc
   allocation_version: string
 ```
-
-Invariants:
 
 ```text
 allocated_equity > 0
@@ -109,16 +99,34 @@ fields:
   source_dataset_id: gold.market.history_full.m1
   compatible_artifact_set_id: string
   capital_allocation_version: string
+  methodology_version: string
   operations_config_version: string
 ```
 
-Invariants:
-
 ```text
 target_symbol and selected instrument are immutable for process lifetime
-all artifacts declare the same symbol, instrument, decision interval, and horizons
-startup fails on unresolved version, hash, symbol, instrument, or expiry mismatch
-PERPETUAL absolute max position fraction <= 1.0
+all loaded artifacts declare the same symbol, instrument, horizons, and methodology
+startup fails on any version, hash, symbol, instrument, or validity mismatch
+```
+
+### 3.3 OperationsConfig.v1
+
+```yaml
+contract: OperationsConfig.v1
+fields:
+  config_version: string
+  market_data_warning_delay_seconds: 120
+  market_data_reduce_only_delay_seconds: 600
+  feature_timeout_seconds: 30
+  maximum_decision_age_seconds: 60
+  maximum_source_gap_minutes: 180
+  reconciliation_halt_seconds: 300
+  pending_execution_plan_timeout_seconds: 120
+  exchange_order_ttl_seconds: integer
+  maximum_clock_offset_milliseconds: 500
+  slippage_breach_multiplier: 2.0
+  slippage_breach_consecutive_plans: 3
+  manual_promotion_required: true
 ```
 
 ## 4. Instrument contracts
@@ -146,7 +154,7 @@ fields:
   simulator_version: string
 ```
 
-Production V1 invariants:
+Production V1:
 
 ```text
 SPOT short_supported = false
@@ -154,7 +162,7 @@ SPOT max_supported_leverage = 1
 SPOT margin_mode = NONE
 PERPETUAL reduce_only_supported = true
 PERPETUAL short_supported = true
-PERPETUAL max deployed leverage <= 1
+PERPETUAL deployed absolute position fraction <= 1
 ```
 
 ### 4.2 InstrumentUniverse.v1
@@ -169,7 +177,11 @@ fields:
   maximum_gap_minutes: 180
   minimum_median_daily_quote_volume: decimal
   minimum_calmar_improvement: 0.10
+  bootstrap_block_length_hours: 24
+  bootstrap_resamples: 10000
+  bootstrap_random_seed: integer
   selection_config_version: string
+  methodology_version: string
 ```
 
 ### 4.3 InstrumentEligibilityResult.v1
@@ -177,7 +189,6 @@ fields:
 ```yaml
 contract: InstrumentEligibilityResult.v1
 fields:
-  target_symbol: BTC|ETH|SOL
   instrument_id: string
   eligible: bool
   decision_grid_coverage: float
@@ -192,8 +203,6 @@ fields:
 
 ### 4.4 InstrumentFoldMetrics.v1
 
-All returns are net of fees, spread, slippage, and funding.
-
 ```yaml
 contract: InstrumentFoldMetrics.v1
 fields:
@@ -206,11 +215,9 @@ fields:
   cvar_95_loss_abs: float
   annualised_turnover: float
   net_sharpe: float|null
-  profitable: bool
+  total_net_return: float
   positive_pnl: decimal
 ```
-
-`net_calmar` is null when maximum drawdown is zero. A candidate with non-positive annualised net return is non-promotable regardless of numerical ratio.
 
 ### 4.5 InstrumentSelectionReport.v1
 
@@ -233,39 +240,22 @@ fields:
   median_calmar_improvement: float|null
   selection_reason: string
   selection_config_version: string
+  methodology_version: string
   code_commit: string
 ```
 
-Perpetual selection invariant:
+Perpetual may be selected only when all eligibility and risk gates pass, the paired Calmar interval lower bound is positive, and median Calmar improvement is at least the configured minimum.
 
-```text
-selected PERPETUAL requires:
-- all eligibility gates pass
-- lower paired Calmar CI bound > 0
-- median Calmar improvement >= minimum_calmar_improvement
-- all risk and cost-stress gates pass
-```
+## 5. Upstream and timing
 
-Otherwise an eligible spot candidate is preferred.
-
-## 5. Upstream and timing contracts
-
-### 5.1 Upstream dataset
+### 5.1 Source dataset
 
 ```text
 dataset_id: gold.market.history_full.m1
 grain: timestamp_m1, exchange, symbol
 ```
 
-Production V1 consumes same-asset:
-
-- spot OHLCV;
-- perpetual OHLCV;
-- funding and freshness;
-- open interest and freshness;
-- perpetual trade-flow aggregates.
-
-Options trade flow is not a Production V1 dependency.
+Production V1 uses same-asset spot OHLCV, perpetual OHLCV, funding, open interest, and perpetual trade flow. Options trade flow is not required.
 
 ### 5.2 DecisionTiming.v1
 
@@ -281,14 +271,11 @@ fields:
   timing_config_version: string
 ```
 
-Invariants:
-
 ```text
 latest_included_bucket_close = as_of
 feature_completed_at > as_of
 decision_persisted_at >= feature_completed_at
 earliest_execution_at > decision_persisted_at
-current time - as_of <= maximum_decision_age_seconds before exposure increase
 ```
 
 ### 5.3 HistoricalFillPolicy.v1
@@ -308,81 +295,56 @@ fields:
 
 ## 6. Feature contracts
 
-### 6.1 Feature freshness defaults
+### 6.1 Freshness defaults
 
 ```yaml
+price_max_age_minutes: 2
 funding_max_age_minutes: 480
 open_interest_max_age_minutes: 120
 perpetual_trade_flow_max_age_minutes: 60
-price_max_age_minutes: 2
+feature_epsilon: 0.000000000001
 ```
-
-These defaults are versioned. A value older than its limit is unavailable.
 
 ### 6.2 Core feature definitions
 
-All lookbacks end at `as_of` and use closed buckets only.
-
-#### return_24h
+All lookbacks end at `as_of` and use closed buckets.
 
 ```text
 return_24h = ln(perp_close_as_of / perp_close_24h_before)
 ```
 
-Both prices must be available and positive.
-
-#### realized_volatility_24h
-
-Let `hourly_return_j` be the 24 consecutive hourly log returns ending at `as_of`.
+For the 24 hourly returns ending at `as_of`:
 
 ```text
 realized_volatility_24h = sqrt(365 * sum(hourly_return_j^2))
 ```
 
-The output is annualised decimal volatility. All 24 returns are required.
-
-#### funding_zscore_30d
-
-Use only distinct observed funding events, not repeated forward-filled M1 rows.
+Using distinct observed funding events only:
 
 ```text
 funding_zscore_30d =
-    (latest_funding_rate - mean(observed_funding_rates_30d))
-    / max(sample_std(observed_funding_rates_30d), feature_epsilon)
+    (latest_funding - mean(observed_funding_30d))
+    / max(sample_std(observed_funding_30d), feature_epsilon)
 ```
 
-At least 30 observed funding events and a fresh latest observation are required.
-
-#### open_interest_change_24h
+At least 30 distinct funding events are required.
 
 ```text
 open_interest_change_24h = ln(open_interest_as_of / open_interest_24h_before)
 ```
 
-Both observations must be positive and pass freshness limits.
-
-#### buy_volume_share_4h
-
 ```text
 buy_volume_share_4h =
-    sum(perps_trades_buy_volume over 4h)
-    / sum(perps_trades_volume over 4h)
+    sum(perps_buy_volume_4h) / sum(perps_total_volume_4h)
 ```
 
-The denominator must be positive. Trade rows are never imputed.
+The denominator must be positive.
 
-#### atr_24h
-
-Aggregate M1 prices into 24 closed hourly bars. For each hour:
+For 24 closed hourly bars:
 
 ```text
-true_range = max(
-    high - low,
-    abs(high - previous_close),
-    abs(low - previous_close)
-)
-
-atr_24h = mean(last 24 true_range values)
+true_range = max(high-low, abs(high-previous_close), abs(low-previous_close))
+atr_24h = mean(last_24_true_ranges)
 ```
 
 ### 6.3 RobustScalerState.v1
@@ -403,8 +365,6 @@ fields:
   fitted_to: datetime_utc
   scaler_hash: string
 ```
-
-Scaling formula:
 
 ```text
 scaled = (value - median) / max(IQR, scaler_epsilon)
@@ -435,14 +395,15 @@ metadata:
   feature_contract_version: string
   feature_set_hash: string
   feature_build_commit: string
+  methodology_version: string
   timing: DecisionTiming.v1
 ```
 
-Production V1 does not emit `DEGRADED`. All five core features and `atr_24h` must be valid. Otherwise status is `FAIL`.
+All five regime features and ATR are required. Missing, stale, non-finite, or incomplete values force `FAIL`.
 
 ### 6.5 TrainingTargetFrame.v1
 
-Training and evaluation only.
+Offline only.
 
 ```yaml
 contract: TrainingTargetFrame.v1
@@ -459,11 +420,10 @@ metadata:
   fill_policy_version: string
   cost_model_version: string
   target_contract_version: string
+  methodology_version: string
 ```
 
-The full future interval and simulated execution costs are required. Targets never enter live inference.
-
-## 7. Cost and state contracts
+## 7. Runtime state
 
 ### 7.1 CostModelSnapshot.v1
 
@@ -485,7 +445,7 @@ fields:
   cost_model_version: string
 ```
 
-For spot, `expected_funding_bps_4h = 0`.
+Spot funding is zero.
 
 ### 7.2 PortfolioState.v1
 
@@ -512,7 +472,7 @@ fields:
   pending_execution_plan_id: string|null
 ```
 
-No virtual opposing positions exist in Production V1.
+Production V1 has no opposing virtual positions.
 
 ### 7.3 OperationalState.v1
 
@@ -531,7 +491,7 @@ fields:
   active_incident_id: string|null
 ```
 
-## 8. Module 1 contracts
+## 8. Module 1
 
 ### 8.1 RegimeTrainingConfig.v1
 
@@ -551,6 +511,7 @@ fields:
   maximum_seed_signature_distance: float
   maximum_state_alignment_distance: float
   feature_set_hash: string
+  methodology_version: string
   config_version: string
 ```
 
@@ -577,15 +538,13 @@ fields:
   model_artifact_hash: string
 ```
 
-Invariants:
-
 ```text
-each probability is finite and in [0,1]
-each vector sums to 1 within tolerance
+probabilities are finite and in [0,1]
+each vector sums to 1
 normalised_entropy is in [0,1]
 maximum_probability = max(current_probabilities)
 most_likely_state = argmax(current_probabilities)
-FAIL or INVALID forces abstain_recommended = true
+FAIL or INVALID forces abstention
 ```
 
 ### 8.3 RegimeStateSignature.v1
@@ -607,26 +566,30 @@ fields:
   occupancy: float
 ```
 
-## 9. Strategy expert contracts
+## 9. Strategy experts
 
 ### 9.1 StrategyConfig.v1
 
 ```yaml
 contract: StrategyConfig.v1
 fields:
+  feature_epsilon: 0.000000000001
   trend:
     fast_ema_hours: 24
     slow_ema_hours: 72
-    minimum_distance_fraction: float
-    strength_scale_fraction: float
+    regression_window_hours: 72
+    minimum_distance_fraction: 0.0025
+    strength_scale_fraction: 0.0200
   momentum:
     return_window_hours: 12
-    minimum_vol_scaled_return: float
-    strength_scale: float
+    minimum_vol_scaled_return: 0.50
+    strength_scale: 2.00
+    flow_strength_scale: 0.25
   mean_reversion:
     zscore_window_hours: 24
-    entry_zscore: float
-    strength_scale_zscore: float
+    entry_zscore: 1.00
+    strength_scale_zscore: 3.00
+  methodology_version: 1.0.0
   config_version: string
 ```
 
@@ -648,15 +611,9 @@ fields:
   strategy_version: string
 ```
 
-Invariants:
+`strength` and `confidence` are in `[0,1]`. `FAIL` forces direction, strength, and confidence to zero.
 
-```text
-strength and confidence are in [0,1]
-FAIL forces direction = 0, strength = 0, confidence = 0
-one signal per strategy and as_of
-```
-
-## 10. Module 2 contracts
+## 10. Module 2
 
 ### 10.1 RegimeStrategyAffinityMatrix.v1
 
@@ -674,10 +631,11 @@ fields:
   minimum_direction_dominance: float
   target_volatility_annual: float
   volatility_floor: float
+  methodology_version: string
   config_version: string
 ```
 
-All affinity values are in `[0,1]`. Each row sum is no greater than `1 - minimum_cash_fraction`.
+All affinity values are in `[0,1]`; each row sum is no greater than `1 - minimum_cash_fraction`.
 
 ### 10.2 ExitProfile.v1
 
@@ -691,12 +649,12 @@ fields:
   profile_version: string
 ```
 
-Production defaults:
+Defaults:
 
 ```text
-MEAN_REVERSION: stop 1.0, take profit 1.5, max holding 240 minutes
-MOMENTUM:       stop 1.5, take profit 2.5, max holding 1440 minutes
-TREND:          stop 2.0, take profit 4.0, max holding 4320 minutes
+MEAN_REVERSION: 1.0 stop, 1.5 take profit, 240 minutes
+MOMENTUM:       1.5 stop, 2.5 take profit, 1440 minutes
+TREND:          2.0 stop, 4.0 take profit, 4320 minutes
 ```
 
 ### 10.3 AllocationProposal.v1
@@ -724,21 +682,19 @@ fields:
   abstain_recommended: bool
   abstain_reasons: list[string]
   allocator_config_version: string
+  methodology_version: string
 ```
-
-Invariants:
 
 ```text
-all contribution weights are in [0,1]
-contribution weights sum to 1
-regime certainty, volatility multiplier, and risk multiplier are in [0,1]
-FLAT implies proposed target position fraction = 0
-SPOT implies proposed target position fraction >= 0
-absolute proposed target position fraction <= 1
-abstention cannot propose a larger absolute exposure than the current reconciled exposure
+weights are in [0,1] and sum to 1
+FLAT implies target fraction = 0
+SPOT implies target fraction >= 0
+absolute target fraction <= 1
+active strategy weights are not renormalised upward
+cash = 1 - sum(active strategy scores)
 ```
 
-## 11. Module 3 contracts
+## 11. Module 3
 
 ### 11.1 RiskLimits.v1
 
@@ -788,24 +744,19 @@ fields:
   risk_config_version: string
 ```
 
-Invariants:
-
 ```text
-approved_target_notional = approved_target_position_fraction * allocated_equity
-absolute approved target <= configured and instrument bounds
+approved notional = approved fraction * allocated equity
 REJECTED and HALTED cannot increase absolute exposure
 abstention cannot increase absolute exposure
 BROKEN reconciliation cannot increase absolute exposure
 expired approval cannot be executed
 ```
 
-The Risk Engine does not emit side, quantity, order type, limit price, or child orders.
+The Risk Engine does not emit side, quantity, order type, or price.
 
-## 12. Execution boundary contracts
+## 12. Execution boundary
 
 ### 12.1 ExecutionPlan.v1
-
-Produced by the external execution system from `ApprovedTargetPosition.v1`.
 
 ```yaml
 contract: ExecutionPlan.v1
@@ -843,7 +794,7 @@ fields:
   failure_reason: string|null
 ```
 
-## 13. Artifact contracts
+## 13. Artifacts
 
 ### 13.1 RegimeModelArtifact.v1
 
@@ -863,6 +814,7 @@ fields:
   training_window: [datetime_utc, datetime_utc]
   inner_metrics: object
   completed_outer_metrics: object
+  methodology_version: string
   code_commit: string
   dependency_lock_hash: string
   artifact_hash: string
@@ -880,6 +832,7 @@ fields:
   exit_profiles: ExitProfile.v1[]
   training_window: [datetime_utc, datetime_utc]
   validation_metrics: object
+  methodology_version: string
   code_commit: string
   artifact_hash: string
 ```
@@ -898,7 +851,9 @@ fields:
   regime_model_id: string
   allocator_artifact_hash: string
   risk_config_version: string
+  operations_config_version: string
   feature_contract_version: string
+  methodology_version: string
   cost_model_version: string
   execution_adapter_version: string
   decision_timing_version: string
@@ -907,9 +862,9 @@ fields:
   compatibility_hash: string
 ```
 
-A production deployment loads the set atomically. Partial artifact substitution is prohibited.
+The set is loaded, promoted, and rolled back atomically.
 
-## 14. Audit contract
+## 14. Audit
 
 ### 14.1 DecisionAuditRecord.v1
 
@@ -933,7 +888,8 @@ fields:
   approved_target: ApprovedTargetPosition.v1
   execution_report: ExecutionReport.v1|null
   portfolio_state_after: PortfolioState.v1|null
+  methodology_version: string
   record_hash: string
 ```
 
-The record is immutable and sufficient to reproduce the analytical decision from pinned source data, code, dependencies, artifacts, and configurations.
+The record is immutable and sufficient to reproduce the analytical decision from pinned source data, code, dependencies, artifacts, methodology, and configurations.
