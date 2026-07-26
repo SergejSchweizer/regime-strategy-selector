@@ -1,943 +1,939 @@
 # Contracts
 
-This document defines the versioned data and service interfaces for `regime-strategy-selector`.
+This document is normative for Production V1. Every field has one unit and one owner. Undefined fields, implicit defaults, cross-symbol payloads, and silent fallbacks are prohibited.
 
-The architecture is described in [`ARCHITECTURE.md`](ARCHITECTURE.md).
+The architecture is defined in [`ARCHITECTURE.md`](ARCHITECTURE.md). Runtime requirements are defined in [`OPERATIONS.md`](OPERATIONS.md).
 
-## 1. Global contract rules
-
-Every training run, model artifact, inference request, portfolio state, allocation proposal, risk decision, and order intent is bound to exactly one configured asset:
+## 1. Global rules
 
 ```text
 target_symbol ∈ {BTC, ETH, SOL}
+selected_instrument_type ∈ {SPOT, PERPETUAL}
+all timestamps use UTC
+all monetary values use the exchange settlement currency
+all percentages are decimal fractions unless the field name ends in _bps
+one basis point = 0.0001
 ```
 
 Global invariants:
 
 ```text
-all payloads in one request chain use the same target_symbol
-payload target_symbol equals deployment target_symbol
-model artifact target_symbol equals deployment target_symbol
+one deployment uses one target_symbol
+one deployment trades one selected instrument
+all payloads in a decision chain share deployment_id, target_symbol, and instrument_id
 source rows satisfy symbol == target_symbol
-cross-asset fields are prohibited
-forward targets are prohibited from inference payloads
-all timestamps are UTC
-all decision inputs use closed source buckets only
+cross-asset features are prohibited
+future targets are prohibited from inference payloads
+feature inputs use closed source buckets only
+wrong-symbol or wrong-instrument input fails closed
 ```
 
-Any symbol mismatch must fail closed before model inference or order creation.
+## 2. Common types and units
 
----
-
-# 2. Upstream dataset contract
-
-## 2.1 Dataset
+### 2.1 Position fraction
 
 ```text
-dataset_id: gold.market.history_full.m1
-grain: one row per timestamp_m1, exchange, symbol
-keys: timestamp_m1, exchange, symbol
+position_fraction = signed instrument notional / allocated_equity
 ```
 
-Only rows matching the configured `target_symbol` are eligible.
-
-## 2.2 Key columns
-
-| Variable | Type | Meaning |
-|---|---|---|
-| `timestamp_m1` | datetime UTC | Closed one-minute bucket |
-| `exchange` | string | Normalised exchange identifier |
-| `symbol` | string | Normalised base asset; allowed project values are `BTC`, `ETH`, `SOL` |
-
-## 2.3 Spot OHLCV
+Bounds:
 
 ```text
-spot_ohlcv_open_price
-spot_ohlcv_high_price
-spot_ohlcv_low_price
-spot_ohlcv_close_price
-spot_ohlcv_volume
-spot_ohlcv_quote_volume
-spot_ohlcv_trade_count
+SPOT:       [0.00, 1.00]
+PERPETUAL: [-1.00, 1.00]
 ```
 
-## 2.4 Perpetual OHLCV
+### 2.2 Direction
 
 ```text
-perp_open_price
-perp_high_price
-perp_low_price
-perp_close_price
-perp_volume
-perp_quote_volume
-perp_trade_count
+SHORT = -1
+FLAT  =  0
+LONG  = +1
 ```
 
-## 2.5 Funding state
+### 2.3 Notional
+
+`notional` is absolute or signed settlement-currency exposure. It is never a base-asset quantity.
+
+### 2.4 Quantity
+
+`quantity` is base-asset or contract quantity and is owned by the execution system. Analytical contracts do not produce exchange quantity.
+
+### 2.5 Price
+
+Prices are settlement currency per base asset unless the exchange instrument explicitly defines a contract multiplier. Contract multiplier conversion is owned by execution.
+
+## 3. Deployment and capital contracts
+
+### 3.1 CapitalAllocation.v1
+
+Produced by an external account-level capital service.
+
+```yaml
+contract: CapitalAllocation.v1
+fields:
+  deployment_id: string
+  target_symbol: BTC|ETH|SOL
+  settlement_currency: string
+  allocated_equity: decimal
+  max_loss_budget: decimal
+  max_margin_budget: decimal
+  valid_from: datetime_utc
+  valid_until: datetime_utc
+  allocation_version: string
+```
+
+Invariants:
 
 ```text
-funding_rate_last_known
-funding_observed_at
-minutes_since_funding
-is_funding_observation_minute
-funding_data_available
+allocated_equity > 0
+0 < max_loss_budget <= allocated_equity
+0 < max_margin_budget <= allocated_equity
+allocation is valid at decision as_of
 ```
 
-## 2.6 Open-interest state
-
-```text
-open_interest_open_interest
-open_interest_is_observed
-open_interest_is_ffill
-minutes_since_open_interest_observation
-open_interest_observation_lag_sec
-open_interest_source_timestamp
-```
-
-## 2.7 Perpetual trade-flow aggregates
-
-```text
-perps_trades_open_price
-perps_trades_high_price
-perps_trades_low_price
-perps_trades_close_price
-perps_trades_volume
-perps_trades_quote_volume
-perps_trades_trade_count
-perps_trades_buy_volume
-perps_trades_sell_volume
-perps_trades_buy_trade_count
-perps_trades_sell_trade_count
-perps_trades_buy_volume_share
-```
-
-## 2.8 Option trade-flow aggregates
-
-```text
-options_trades_open_price
-options_trades_high_price
-options_trades_low_price
-options_trades_close_price
-options_trades_volume
-options_trades_quote_volume
-options_trades_trade_count
-options_trades_buy_volume
-options_trades_sell_volume
-options_trades_buy_trade_count
-options_trades_sell_trade_count
-options_trades_buy_volume_share
-```
-
-## 2.9 Upstream invariants
-
-```text
-rows are unique on timestamp_m1, exchange, symbol
-rows are sorted by timestamp_m1
-trade executions, volume, and counts are never forward-filled
-last-known funding and open-interest values retain age and availability metadata
-missing source values remain null unless the upstream dataset explicitly supplies a state value and freshness metadata
-```
-
----
-
-# 3. Configuration contracts
-
-## 3.1 DeploymentConfig.v1
+### 3.2 DeploymentConfig.v1
 
 ```yaml
 contract: DeploymentConfig.v1
 fields:
   deployment_id: string
   target_symbol: BTC|ETH|SOL
+  selected_instrument_id: string
+  selected_instrument_type: SPOT|PERPETUAL
   exchange: string
-  decision_interval: string
+  settlement_currency: string
+  decision_interval_minutes: 60
+  primary_horizon_minutes: 240
+  stress_horizon_minutes: 1440
   source_dataset_id: gold.market.history_full.m1
-  regime_model_id: string
-  allocator_model_id: string
-  risk_config_version: string
-  feature_contract_version: string
-  strategy_config_versions: map[string, string]
-  cost_model_version: string
-  execution_config_version: string
+  compatible_artifact_set_id: string
+  capital_allocation_version: string
+  operations_config_version: string
 ```
 
 Invariants:
 
 ```text
-target_symbol is immutable for the lifetime of the deployment process
-all loaded artifacts declare the same target_symbol
-all contract versions are resolvable before startup
-startup fails on any hash, symbol, or version mismatch
+target_symbol and selected instrument are immutable for process lifetime
+all artifacts declare the same symbol, instrument, decision interval, and horizons
+startup fails on unresolved version, hash, symbol, instrument, or expiry mismatch
+PERPETUAL absolute max position fraction <= 1.0
 ```
 
-## 3.2 FeatureRegistryEntry.v1
+## 4. Instrument contracts
+
+### 4.1 InstrumentCandidate.v1
 
 ```yaml
-contract: FeatureRegistryEntry.v1
+contract: InstrumentCandidate.v1
 fields:
-  feature_name: string
-  feature_family: string
-  source_columns: list[string]
-  lookback_minutes: integer
-  decision_interval: string
-  availability_rule: string
-  missing_value_policy: string
-  scaler_candidates: list[string]
-  live_reproducible: bool
-  computation_version: string
-  expected_directional_role: string|null
-```
-
-A feature is ineligible if:
-
-- it references another asset;
-- it uses a future observation;
-- timestamp semantics are ambiguous;
-- it cannot be reproduced by the live feature service;
-- it silently imputes event data;
-- it has no versioned implementation;
-- required lookback is unavailable.
-
-## 3.3 WalkForwardSplit.v1
-
-```yaml
-contract: WalkForwardSplit.v1
-fields:
-  split_id: string
   target_symbol: BTC|ETH|SOL
-  train_start: datetime_utc
-  train_end: datetime_utc
-  validation_start: datetime_utc
-  validation_end: datetime_utc
-  purge_minutes: integer
-  embargo_minutes: integer
-  decision_interval: string
+  exchange: string
+  instrument_id: string
+  instrument_type: SPOT|PERPETUAL
+  settlement_currency: string
+  contract_multiplier: decimal
+  min_quantity: decimal
+  quantity_step: decimal
+  price_tick: decimal
+  reduce_only_supported: bool
+  short_supported: bool
+  max_supported_leverage: decimal
+  margin_mode: NONE|ISOLATED
+  fee_schedule_version: string
+  execution_adapter_version: string
+  simulator_version: string
 ```
 
----
+Production V1 invariants:
 
-# 4. Feature and target contracts
+```text
+SPOT short_supported = false
+SPOT max_supported_leverage = 1
+SPOT margin_mode = NONE
+PERPETUAL reduce_only_supported = true
+PERPETUAL short_supported = true
+PERPETUAL max deployed leverage <= 1
+```
 
-## 4.1 MarketFeatureFrame.v1
+### 4.2 InstrumentUniverse.v1
 
-One point-in-time feature row for one configured asset.
+```yaml
+contract: InstrumentUniverse.v1
+fields:
+  universe_id: string
+  target_symbol: BTC|ETH|SOL
+  candidates: InstrumentCandidate.v1[]
+  minimum_decision_grid_coverage: 0.995
+  maximum_gap_minutes: 180
+  minimum_median_daily_quote_volume: decimal
+  minimum_calmar_improvement: 0.10
+  selection_config_version: string
+```
+
+### 4.3 InstrumentEligibilityResult.v1
+
+```yaml
+contract: InstrumentEligibilityResult.v1
+fields:
+  target_symbol: BTC|ETH|SOL
+  instrument_id: string
+  eligible: bool
+  decision_grid_coverage: float
+  maximum_gap_minutes: integer
+  median_daily_quote_volume: decimal
+  cost_model_complete: bool
+  simulator_live_parity: bool
+  execution_supported: bool
+  reconciliation_supported: bool
+  failed_gates: list[string]
+```
+
+### 4.4 InstrumentFoldMetrics.v1
+
+All returns are net of fees, spread, slippage, and funding.
+
+```yaml
+contract: InstrumentFoldMetrics.v1
+fields:
+  outer_fold_id: string
+  target_symbol: BTC|ETH|SOL
+  instrument_id: string
+  annualised_net_return: float
+  maximum_drawdown_abs: float
+  net_calmar: float|null
+  cvar_95_loss_abs: float
+  annualised_turnover: float
+  net_sharpe: float|null
+  profitable: bool
+  positive_pnl: decimal
+```
+
+`net_calmar` is null when maximum drawdown is zero. A candidate with non-positive annualised net return is non-promotable regardless of numerical ratio.
+
+### 4.5 InstrumentSelectionReport.v1
+
+```yaml
+contract: InstrumentSelectionReport.v1
+fields:
+  report_id: string
+  target_symbol: BTC|ETH|SOL
+  universe_id: string
+  completed_outer_fold_ids: list[string]
+  eligibility_results: InstrumentEligibilityResult.v1[]
+  fold_metrics: InstrumentFoldMetrics.v1[]
+  selected_instrument_id: string
+  selected_instrument_type: SPOT|PERPETUAL
+  median_net_calmar_by_instrument: map[string, float|null]
+  median_cvar_95_loss_by_instrument: map[string, float]
+  median_annualised_net_return_by_instrument: map[string, float]
+  median_annualised_turnover_by_instrument: map[string, float]
+  paired_calmar_difference_ci_95: [float, float]|null
+  median_calmar_improvement: float|null
+  selection_reason: string
+  selection_config_version: string
+  code_commit: string
+```
+
+Perpetual selection invariant:
+
+```text
+selected PERPETUAL requires:
+- all eligibility gates pass
+- lower paired Calmar CI bound > 0
+- median Calmar improvement >= minimum_calmar_improvement
+- all risk and cost-stress gates pass
+```
+
+Otherwise an eligible spot candidate is preferred.
+
+## 5. Upstream and timing contracts
+
+### 5.1 Upstream dataset
+
+```text
+dataset_id: gold.market.history_full.m1
+grain: timestamp_m1, exchange, symbol
+```
+
+Production V1 consumes same-asset:
+
+- spot OHLCV;
+- perpetual OHLCV;
+- funding and freshness;
+- open interest and freshness;
+- perpetual trade-flow aggregates.
+
+Options trade flow is not a Production V1 dependency.
+
+### 5.2 DecisionTiming.v1
+
+```yaml
+contract: DecisionTiming.v1
+fields:
+  as_of: datetime_utc
+  latest_included_bucket_close: datetime_utc
+  feature_completed_at: datetime_utc
+  decision_persisted_at: datetime_utc
+  earliest_execution_at: datetime_utc
+  maximum_decision_age_seconds: integer
+  timing_config_version: string
+```
+
+Invariants:
+
+```text
+latest_included_bucket_close = as_of
+feature_completed_at > as_of
+decision_persisted_at >= feature_completed_at
+earliest_execution_at > decision_persisted_at
+current time - as_of <= maximum_decision_age_seconds before exposure increase
+```
+
+### 5.3 HistoricalFillPolicy.v1
+
+```yaml
+contract: HistoricalFillPolicy.v1
+fields:
+  entry_rule: NEXT_M1_OPEN_STRICTLY_AFTER_AS_OF
+  same_bar_exit_priority: STOP_FIRST
+  gap_stop_rule: FIRST_TRADABLE_PRICE_PLUS_ADVERSE_SLIPPAGE
+  spread_model_version: string
+  slippage_model_version: string
+  fee_model_version: string
+  funding_model_version: string
+  policy_version: string
+```
+
+## 6. Feature contracts
+
+### 6.1 Feature freshness defaults
+
+```yaml
+funding_max_age_minutes: 480
+open_interest_max_age_minutes: 120
+perpetual_trade_flow_max_age_minutes: 60
+price_max_age_minutes: 2
+```
+
+These defaults are versioned. A value older than its limit is unavailable.
+
+### 6.2 Core feature definitions
+
+All lookbacks end at `as_of` and use closed buckets only.
+
+#### return_24h
+
+```text
+return_24h = ln(perp_close_as_of / perp_close_24h_before)
+```
+
+Both prices must be available and positive.
+
+#### realized_volatility_24h
+
+Let `hourly_return_j` be the 24 consecutive hourly log returns ending at `as_of`.
+
+```text
+realized_volatility_24h = sqrt(365 * sum(hourly_return_j^2))
+```
+
+The output is annualised decimal volatility. All 24 returns are required.
+
+#### funding_zscore_30d
+
+Use only distinct observed funding events, not repeated forward-filled M1 rows.
+
+```text
+funding_zscore_30d =
+    (latest_funding_rate - mean(observed_funding_rates_30d))
+    / max(sample_std(observed_funding_rates_30d), feature_epsilon)
+```
+
+At least 30 observed funding events and a fresh latest observation are required.
+
+#### open_interest_change_24h
+
+```text
+open_interest_change_24h = ln(open_interest_as_of / open_interest_24h_before)
+```
+
+Both observations must be positive and pass freshness limits.
+
+#### buy_volume_share_4h
+
+```text
+buy_volume_share_4h =
+    sum(perps_trades_buy_volume over 4h)
+    / sum(perps_trades_volume over 4h)
+```
+
+The denominator must be positive. Trade rows are never imputed.
+
+#### atr_24h
+
+Aggregate M1 prices into 24 closed hourly bars. For each hour:
+
+```text
+true_range = max(
+    high - low,
+    abs(high - previous_close),
+    abs(low - previous_close)
+)
+
+atr_24h = mean(last 24 true_range values)
+```
+
+### 6.3 RobustScalerState.v1
+
+```yaml
+contract: RobustScalerState.v1
+fields:
+  ordered_features:
+    - return_24h
+    - realized_volatility_24h
+    - funding_zscore_30d
+    - open_interest_change_24h
+    - buy_volume_share_4h
+  median_by_feature: map[string, float]
+  iqr_by_feature: map[string, float]
+  scaler_epsilon: float
+  fitted_from: datetime_utc
+  fitted_to: datetime_utc
+  scaler_hash: string
+```
+
+Scaling formula:
+
+```text
+scaled = (value - median) / max(IQR, scaler_epsilon)
+```
+
+### 6.4 MarketFeatureFrame.v1
 
 ```yaml
 contract: MarketFeatureFrame.v1
 keys:
+  deployment_id: string
   as_of: datetime_utc
-  exchange: string
   target_symbol: BTC|ETH|SOL
 fields:
-  source_features: map[string, float|int|bool|null]
-  derived_features: map[string, float|int|bool|null]
-  availability_flags: map[string, bool]
-  observation_ages: map[string, float|null]
-  data_quality_status: PASS|DEGRADED|FAIL
+  return_24h: float|null
+  realized_volatility_24h: float|null
+  funding_zscore_30d: float|null
+  open_interest_change_24h: float|null
+  buy_volume_share_4h: float|null
+  atr_24h: float|null
+  source_availability: map[string, bool]
+  observation_age_minutes: map[string, float|null]
+  data_quality_status: PASS|FAIL
+  failure_reasons: list[string]
 metadata:
-  source_dataset_id: gold.market.history_full.m1
   source_dataset_version: string
+  source_data_hash: string
   feature_contract_version: string
   feature_set_hash: string
-  source_data_hash: string
-  build_git_commit: string
-  decision_interval: string
+  feature_build_commit: string
+  timing: DecisionTiming.v1
 ```
 
-Invariants:
+Production V1 does not emit `DEGRADED`. All five core features and `atr_24h` must be valid. Otherwise status is `FAIL`.
 
-```text
-target_symbol matches deployment target_symbol
-all source buckets are closed at as_of
-no future target or label is present
-no cross-asset feature is present
-feature_set_hash matches the model artifact
-state freshness is explicit
-trade executions and volumes are never imputed
-FAIL status forbids learned-model trading decisions
-```
+### 6.5 TrainingTargetFrame.v1
 
-## 4.2 Candidate derived feature families
-
-### Returns
-
-```text
-log_return_5m
-log_return_15m
-log_return_1h
-log_return_4h
-log_return_1d
-```
-
-### Trend
-
-```text
-ema_distance_<window>
-ema_slope_<window>
-breakout_distance_<window>
-directional_persistence_<window>
-regression_slope_<window>
-regression_r2_<window>
-```
-
-### Momentum
-
-```text
-vol_scaled_return_<window>
-return_acceleration_<window>
-volume_confirmed_momentum_<window>
-```
-
-### Mean reversion
-
-```text
-price_zscore_<window>
-vwap_distance_<window>
-bollinger_distance_<window>
-spot_perp_spread_zscore_<window>
-mean_reversion_half_life_<window>
-short_horizon_reversal_<window>
-```
-
-### Volatility
-
-```text
-realized_volatility_<window>
-downside_volatility_<window>
-range_volatility_<window>
-volatility_of_volatility_<window>
-jump_proxy_<window>
-atr_<window>
-```
-
-### Carry and leverage
-
-```text
-funding_level
-funding_change_<window>
-funding_zscore_<window>
-funding_direction
-funding_freshness
-open_interest_change_<window>
-price_oi_interaction_<window>
-open_interest_freshness
-```
-
-### Trade flow and activity
-
-```text
-buy_volume_share_<window>
-signed_volume_<window>
-trade_count_imbalance_<window>
-average_trade_size_proxy_<window>
-turnover_<window>
-volume_zscore_<window>
-trade_count_zscore_<window>
-amihud_proxy_<window>
-```
-
-### Basis
-
-```text
-spot_perp_spread
-spot_perp_spread_change_<window>
-spot_perp_spread_zscore_<window>
-```
-
-### Data quality
-
-```text
-missing_feature_count
-stale_state_count
-maximum_observation_age
-contiguous_history_minutes
-```
-
-The exact closed feature list is owned by the feature registry and feature-set hash, not by this illustrative list.
-
-## 4.3 TrainingTargetFrame.v1
-
-Training and evaluation only. Never passed to inference.
+Training and evaluation only.
 
 ```yaml
 contract: TrainingTargetFrame.v1
 keys:
   as_of: datetime_utc
   target_symbol: BTC|ETH|SOL
+  instrument_id: string
 fields:
-  forward_log_return_1h: float|null
-  forward_log_return_4h: float|null
-  forward_log_return_1d: float|null
-  forward_drawdown_1h: float|null
-  forward_drawdown_4h: float|null
-  forward_drawdown_1d: float|null
-  forward_realized_volatility_1h: float|null
+  forward_net_return_4h: float|null
+  forward_drawdown_4h_abs: float|null
   forward_realized_volatility_4h: float|null
-  forward_realized_volatility_1d: float|null
-  cost_adjusted_return_1h: float|null
-  cost_adjusted_return_4h: float|null
-  cost_adjusted_return_1d: float|null
+  forward_drawdown_1d_abs: float|null
 metadata:
-  target_contract_version: string
-  target_build_commit: string
+  fill_policy_version: string
   cost_model_version: string
+  target_contract_version: string
 ```
 
-Invariants:
+The full future interval and simulated execution costs are required. Targets never enter live inference.
 
-```text
-target_symbol matches source row symbol
-a target is null unless its complete future horizon exists
-targets are excluded from MarketFeatureFrame.v1
-targets are excluded from all live inference requests
-validation embargo is at least the longest target horizon
-```
+## 7. Cost and state contracts
 
----
-
-# 5. Runtime state contracts
-
-## 5.1 PortfolioState.v1
-
-Produced by the portfolio and execution subsystem for one asset.
-
-```yaml
-contract: PortfolioState.v1
-fields:
-  as_of: datetime_utc
-  target_symbol: BTC|ETH|SOL
-  equity: float
-  cash: float
-  gross_exposure: float
-  net_exposure: float
-  current_drawdown: float
-  daily_pnl: float
-  rolling_pnl: float
-  exchange_position: float
-  virtual_sleeve_positions:
-    trend: float
-    momentum: float
-    mean_reversion: float
-  unrealized_pnl_by_sleeve: map[string, float]
-  realized_pnl_by_sleeve: map[string, float]
-  time_in_position_by_sleeve: map[string, integer]
-  realized_turnover: float
-  pending_orders: list
-  reconciliation_status: RECONCILED|PENDING|BROKEN
-```
-
-Invariants:
-
-```text
-exchange_position reconciles to the net sleeve position within tolerance
-BROKEN reconciliation status forbids exposure increases
-all positions and pending orders reference target_symbol only
-```
-
-## 5.2 CostModelSnapshot.v1
+### 7.1 CostModelSnapshot.v1
 
 ```yaml
 contract: CostModelSnapshot.v1
 fields:
   as_of: datetime_utc
   target_symbol: BTC|ETH|SOL
+  instrument_id: string
+  instrument_type: SPOT|PERPETUAL
   maker_fee_bps: float
   taker_fee_bps: float
-  expected_spread_bps: float
-  expected_slippage_bps: float
-  funding_rate: float|null
-  estimated_capacity_notional: float|null
+  expected_half_spread_bps: float
+  expected_entry_slippage_bps: float
+  expected_exit_slippage_bps: float
+  expected_funding_bps_4h: float
+  estimated_capacity_notional: decimal
   scenario: BASE|ELEVATED|SEVERE|LIVE
   cost_model_version: string
 ```
 
-Historical values are estimated from the configured asset's market data and exchange fee configuration. Live values are supplied by the execution layer.
+For spot, `expected_funding_bps_4h = 0`.
 
-## 5.3 OperationalState.v1
+### 7.2 PortfolioState.v1
+
+```yaml
+contract: PortfolioState.v1
+fields:
+  as_of: datetime_utc
+  deployment_id: string
+  target_symbol: BTC|ETH|SOL
+  instrument_id: string
+  allocated_equity: decimal
+  cash_available: decimal
+  current_position_fraction: float
+  current_position_notional: decimal
+  current_average_entry_price: decimal|null
+  current_unrealised_pnl: decimal
+  current_realised_pnl_day: decimal
+  current_drawdown_abs: float
+  rolling_loss_abs: float
+  current_stop_price: decimal|null
+  current_take_profit_price: decimal|null
+  position_opened_at: datetime_utc|null
+  reconciliation_status: RECONCILED|PENDING|BROKEN
+  pending_execution_plan_id: string|null
+```
+
+No virtual opposing positions exist in Production V1.
+
+### 7.3 OperationalState.v1
 
 ```yaml
 contract: OperationalState.v1
 fields:
   as_of: datetime_utc
-  target_symbol: BTC|ETH|SOL
+  deployment_id: string
   market_data_connected: bool
-  exchange_connected: bool
+  execution_connected: bool
   model_service_healthy: bool
+  feature_service_healthy: bool
   portfolio_reconciled: bool
-  pending_order_count: integer
-  oldest_pending_order_age_seconds: float|null
+  decision_lock_available: bool
   kill_switch_active: bool
-  incident_id: string|null
+  active_incident_id: string|null
 ```
 
----
+## 8. Module 1 contracts
 
-# 6. Module 1 contracts
-
-## 6.1 RegimeTrainingInput.v1
+### 8.1 RegimeTrainingConfig.v1
 
 ```yaml
-contract: RegimeTrainingInput.v1
+contract: RegimeTrainingConfig.v1
 fields:
   target_symbol: BTC|ETH|SOL
-  features: MarketFeatureFrame.v1[]
-  targets: TrainingTargetFrame.v1[]
-  training_window_start: datetime_utc
-  training_window_end: datetime_utc
-  n_regimes: 3
-  candidate_feature_registry: FeatureRegistryEntry.v1[]
-  inner_walk_forward_splits: WalkForwardSplit.v1[]
-  optimization_config_version: string
-  selection_config_version: string
+  n_states: 3
+  model_family: GAUSSIAN_HMM
+  covariance_type: DIAGONAL
+  n_initialisations: 20
+  minimum_converged_initialisations: 16
+  minimum_state_occupancy: 0.05
+  minimum_median_duration_steps: 2
+  maximum_normalised_entropy: float
+  minimum_maximum_probability: float
+  maximum_seed_signature_distance: float
+  maximum_state_alignment_distance: float
+  feature_set_hash: string
+  config_version: string
 ```
 
-Targets may be used for economic evaluation of discovered regimes, but never as HMM emission features or inference inputs.
-
-## 6.2 RegimeInferenceInput.v1
-
-```yaml
-contract: RegimeInferenceInput.v1
-fields:
-  as_of: datetime_utc
-  target_symbol: BTC|ETH|SOL
-  feature_row: MarketFeatureFrame.v1
-  model_id: string
-```
-
-## 6.3 RegimePrediction.v1
+### 8.2 RegimePrediction.v1
 
 ```yaml
 contract: RegimePrediction.v1
 fields:
+  deployment_id: string
   as_of: datetime_utc
   target_symbol: BTC|ETH|SOL
   model_id: string
-  model_family: string
-  model_version: string
-  feature_set_hash: string
-  current_probabilities:
-    regime_0: float
-    regime_1: float
-    regime_2: float
-  forward_probabilities:
-    horizon_1h: [float, float, float]
-    horizon_4h: [float, float, float]
-    horizon_1d: [float, float, float]
-  most_likely_regime: integer
-  transition_risk: float
-  probability_entropy: float
-  model_confidence: float
+  current_probabilities: [float, float, float]
+  forward_probabilities_4h: [float, float, float]
+  normalised_entropy: float
+  maximum_probability: float
+  most_likely_state: 0|1|2
+  state_signature_ids: [string, string, string]
+  state_alignment_status: VALID|INVALID
   abstain_recommended: bool
   abstain_reasons: list[string]
-  data_quality_status: PASS|DEGRADED|FAIL
-  state_signature_ids: [string, string, string]
+  data_quality_status: PASS|FAIL
+  feature_set_hash: string
+  model_artifact_hash: string
 ```
 
 Invariants:
 
 ```text
-each probability is between zero and one
-each probability vector sums to one within tolerance
-most_likely_regime equals argmax(current_probabilities)
-probabilities are filtered using observations available through as_of only
-FAIL data quality forces abstain_recommended = true
-target_symbol and feature_set_hash match the loaded artifact
+each probability is finite and in [0,1]
+each vector sums to 1 within tolerance
+normalised_entropy is in [0,1]
+maximum_probability = max(current_probabilities)
+most_likely_state = argmax(current_probabilities)
+FAIL or INVALID forces abstain_recommended = true
 ```
 
-## 6.4 RegimeStateSignature.v1
+### 8.3 RegimeStateSignature.v1
 
 ```yaml
 contract: RegimeStateSignature.v1
 fields:
-  target_symbol: BTC|ETH|SOL
   signature_id: string
-  mean_return: float
-  realized_volatility: float
-  downside_volatility: float
+  target_symbol: BTC|ETH|SOL
+  mean_return_4h: float
+  realized_volatility_4h: float
+  downside_volatility_4h: float
   trend_strength: float
-  drawdown_state: float
-  funding_state: float|null
-  open_interest_change: float|null
-  flow_imbalance: float|null
-  median_duration: float
+  mean_drawdown_4h_abs: float
+  mean_funding_zscore: float
+  mean_open_interest_change: float
+  mean_buy_volume_share: float
+  median_duration_steps: float
   occupancy: float
 ```
 
-State IDs are aligned across folds and retraining windows using these normalized signatures. Raw model state numbers must not be used as permanent business identifiers.
+## 9. Strategy expert contracts
 
----
-
-# 7. Strategy expert contracts
-
-## 7.1 StrategyExpertInput.v1
+### 9.1 StrategyConfig.v1
 
 ```yaml
-contract: StrategyExpertInput.v1
+contract: StrategyConfig.v1
 fields:
-  as_of: datetime_utc
-  target_symbol: BTC|ETH|SOL
-  feature_row: MarketFeatureFrame.v1
-  cost_snapshot: CostModelSnapshot.v1
-  strategy_config_version: string
+  trend:
+    fast_ema_hours: 24
+    slow_ema_hours: 72
+    minimum_distance_fraction: float
+    strength_scale_fraction: float
+  momentum:
+    return_window_hours: 12
+    minimum_vol_scaled_return: float
+    strength_scale: float
+  mean_reversion:
+    zscore_window_hours: 24
+    entry_zscore: float
+    strength_scale_zscore: float
+  config_version: string
 ```
 
-Regime probabilities are deliberately absent. Experts must remain independently testable.
-
-## 7.2 StrategyExpertSignal.v1
-
-One record per strategy expert.
+### 9.2 StrategyExpertSignal.v1
 
 ```yaml
 contract: StrategyExpertSignal.v1
 fields:
+  deployment_id: string
   as_of: datetime_utc
   target_symbol: BTC|ETH|SOL
-  strategy_id: trend|momentum|mean_reversion
-  strategy_version: string
-  signal_direction: float
-  signal_strength: float
-  signal_confidence: float
-  expected_return: float|null
-  expected_volatility: float|null
+  strategy_id: TREND|MOMENTUM|MEAN_REVERSION
+  direction: -1|0|1
+  strength: float
+  confidence: float
   expected_holding_minutes: integer
-  estimated_cost_bps: float
-  estimated_capacity_notional: float|null
-  raw_target_exposure: float
-  data_quality_status: PASS|DEGRADED|FAIL
+  estimated_round_trip_cost_bps: float
+  data_quality_status: PASS|FAIL
+  strategy_version: string
 ```
 
 Invariants:
 
 ```text
-signal_direction is in [-1, 1]
-signal_strength and signal_confidence are in [0, 1]
-FAIL status forces raw_target_exposure = 0
-all three experts emit at most one signal per as_of and target_symbol
+strength and confidence are in [0,1]
+FAIL forces direction = 0, strength = 0, confidence = 0
+one signal per strategy and as_of
 ```
 
----
+## 10. Module 2 contracts
 
-# 8. Module 2 contracts
-
-## 8.1 AllocatorTrainingInput.v1
+### 10.1 RegimeStrategyAffinityMatrix.v1
 
 ```yaml
-contract: AllocatorTrainingInput.v1
+contract: RegimeStrategyAffinityMatrix.v1
 fields:
   target_symbol: BTC|ETH|SOL
-  regime_candidate_id: string
-  oof_regime_predictions: RegimePrediction.v1[]
-  expert_signals: StrategyExpertSignal.v1[]
-  portfolio_state_path: PortfolioState.v1[]
-  cost_snapshots: CostModelSnapshot.v1[]
-  targets: TrainingTargetFrame.v1[]
-  inner_walk_forward_splits: WalkForwardSplit.v1[]
-  action_space_version: string
-  selection_config_version: string
+  instrument_id: string
+  state_signature_ids: [string, string, string]
+  strategy_order: [TREND, MOMENTUM, MEAN_REVERSION]
+  affinity_matrix: [[float, float, float], [float, float, float], [float, float, float]]
+  affinity_epsilon: float
+  minimum_cash_fraction: float
+  minimum_consensus_evidence: float
+  minimum_direction_dominance: float
+  target_volatility_annual: float
+  volatility_floor: float
+  config_version: string
 ```
 
-Only out-of-fold regime predictions produced by earlier-only fits are allowed.
+All affinity values are in `[0,1]`. Each row sum is no greater than `1 - minimum_cash_fraction`.
 
-## 8.2 AllocatorInferenceInput.v1
+### 10.2 ExitProfile.v1
 
 ```yaml
-contract: AllocatorInferenceInput.v1
+contract: ExitProfile.v1
 fields:
-  as_of: datetime_utc
-  target_symbol: BTC|ETH|SOL
-  regime_prediction: RegimePrediction.v1
-  expert_signals:
-    trend: StrategyExpertSignal.v1
-    momentum: StrategyExpertSignal.v1
-    mean_reversion: StrategyExpertSignal.v1
-  portfolio_state: PortfolioState.v1
-  cost_snapshot: CostModelSnapshot.v1
-  allocator_model_id: string
+  profile_id: MEAN_REVERSION|MOMENTUM|TREND
+  stop_atr_multiple: float
+  take_profit_atr_multiple: float
+  maximum_holding_minutes: integer
+  profile_version: string
 ```
 
-## 8.3 AllocationProposal.v1
+Production defaults:
+
+```text
+MEAN_REVERSION: stop 1.0, take profit 1.5, max holding 240 minutes
+MOMENTUM:       stop 1.5, take profit 2.5, max holding 1440 minutes
+TREND:          stop 2.0, take profit 4.0, max holding 4320 minutes
+```
+
+### 10.3 AllocationProposal.v1
 
 ```yaml
 contract: AllocationProposal.v1
 fields:
   proposal_id: string
+  deployment_id: string
   as_of: datetime_utc
   target_symbol: BTC|ETH|SOL
-  allocator_model_id: string
-  allocator_model_family: string
-  allocator_version: string
-  regime_model_id: string
-  risk_budget_by_sleeve:
+  instrument_id: string
+  strategy_contribution_weights:
     trend: float
     momentum: float
     mean_reversion: float
-  cash_budget: float
-  signed_target_exposure_by_sleeve:
-    trend: float
-    momentum: float
-    mean_reversion: float
-  gross_target_exposure: float
-  net_target_exposure: float
+    cash: float
+  consensus_direction: SHORT|FLAT|LONG
+  regime_certainty: float
+  volatility_multiplier: float
   global_risk_multiplier: float
-  exit_profile_by_sleeve: map[string, string]
-  expected_holding_minutes_by_sleeve: map[string, integer]
-  policy_confidence: float
+  proposed_target_position_fraction: float
+  dominant_strategy: TREND|MOMENTUM|MEAN_REVERSION|null
+  exit_profile_id: MEAN_REVERSION|MOMENTUM|TREND|null
   abstain_recommended: bool
   abstain_reasons: list[string]
-  expected_net_utility: float|null
-  estimated_turnover: float
-  estimated_cost_bps: float
+  allocator_config_version: string
 ```
 
 Invariants:
 
 ```text
-all risk budgets and cash_budget are non-negative
-sum(risk budgets) + cash_budget = 1 within tolerance
-global_risk_multiplier is within configured bounds
-signed sleeve exposures follow the corresponding expert direction unless explicitly neutral
-net_target_exposure equals the sum of signed sleeve exposures after policy scaling
-gross_target_exposure equals the sum of absolute signed sleeve exposures
-target_symbol matches all inputs and artifacts
+all contribution weights are in [0,1]
+contribution weights sum to 1
+regime certainty, volatility multiplier, and risk multiplier are in [0,1]
+FLAT implies proposed target position fraction = 0
+SPOT implies proposed target position fraction >= 0
+absolute proposed target position fraction <= 1
+abstention cannot propose a larger absolute exposure than the current reconciled exposure
 ```
 
-The proposal is advisory. Module 3 may reduce or reject every field.
+## 11. Module 3 contracts
 
----
-
-# 9. Module 3 contracts
-
-## 9.1 RiskLimits.v1
+### 11.1 RiskLimits.v1
 
 ```yaml
 contract: RiskLimits.v1
 fields:
+  deployment_id: string
   target_symbol: BTC|ETH|SOL
-  max_gross_exposure: float
-  max_net_exposure: float
-  max_leverage: float
+  instrument_id: string
+  max_abs_position_fraction: float
+  max_abs_target_change_per_decision: float
+  max_daily_turnover_fraction: float
+  max_daily_loss_abs: float
+  max_rolling_loss_abs: float
+  max_drawdown_abs: float
   max_margin_fraction: float
-  max_sleeve_exposure: map[string, float]
-  max_daily_loss: float
-  max_rolling_loss: float
-  max_drawdown: float
-  max_order_notional: float
-  max_turnover_per_day: float
-  max_order_frequency: integer
-  max_expected_cost_bps: float
-  max_funding_rate: float|null
-  min_model_confidence: float
-  max_regime_entropy: float
-  stale_data_limits: map[string, float]
+  minimum_liquidation_buffer_fraction: float
+  max_expected_round_trip_cost_bps: float
+  maximum_normalised_entropy: float
+  minimum_maximum_probability: float
+  max_decision_age_seconds: integer
   config_version: string
 ```
 
-## 9.2 ExchangeConstraints.v1
+### 11.2 ApprovedTargetPosition.v1
 
 ```yaml
-contract: ExchangeConstraints.v1
+contract: ApprovedTargetPosition.v1
 fields:
-  target_symbol: BTC|ETH|SOL
-  instrument_id: string
-  min_order_size: float
-  order_size_step: float
-  price_tick: float
-  max_leverage: float
-  margin_mode: string
-  allowed_order_types: list[string]
-  reduce_only_supported: bool
-  constraints_version: string
-```
-
-## 9.3 RiskEngineInput.v1
-
-```yaml
-contract: RiskEngineInput.v1
-fields:
-  as_of: datetime_utc
-  target_symbol: BTC|ETH|SOL
-  proposal: AllocationProposal.v1
-  regime_prediction: RegimePrediction.v1
-  expert_signals: StrategyExpertSignal.v1[]
-  feature_row: MarketFeatureFrame.v1
-  portfolio_state: PortfolioState.v1
-  cost_snapshot: CostModelSnapshot.v1
-  risk_limits: RiskLimits.v1
-  exchange_constraints: ExchangeConstraints.v1
-  operational_state: OperationalState.v1
-```
-
-## 9.4 OrderIntent.v1
-
-```yaml
-contract: OrderIntent.v1
-fields:
-  intent_id: string
-  as_of: datetime_utc
-  target_symbol: BTC|ETH|SOL
-  instrument_id: string
-  side: BUY|SELL
-  quantity: float
-  order_type: MARKET|LIMIT|STOP|TAKE_PROFIT
-  limit_price: float|null
-  stop_price: float|null
-  reduce_only: bool
-  sleeve_attribution: map[string, float]
-  idempotency_key: string
-  risk_decision_id: string
-```
-
-## 9.5 RiskDecision.v1
-
-```yaml
-contract: RiskDecision.v1
-fields:
-  risk_decision_id: string
-  as_of: datetime_utc
-  target_symbol: BTC|ETH|SOL
+  approval_id: string
   proposal_id: string
-  status: APPROVED|CLIPPED|NETTED|REJECTED|HALTED
-  approved_risk_budget_by_sleeve: map[string, float]
-  approved_signed_exposure_by_sleeve: map[string, float]
-  approved_net_target_exposure: float
-  approved_stop_level_by_sleeve: map[string, float]
-  approved_take_profit_level_by_sleeve: map[string, float]
-  approved_order_intents: OrderIntent.v1[]
-  rejected_actions: list
+  deployment_id: string
+  as_of: datetime_utc
+  valid_until: datetime_utc
+  target_symbol: BTC|ETH|SOL
+  instrument_id: string
+  status: APPROVED|CLIPPED|REJECTED|HALTED
+  current_position_fraction: float
+  approved_target_position_fraction: float
+  approved_target_notional: decimal
+  approved_stop_atr_multiple: float|null
+  approved_take_profit_atr_multiple: float|null
+  approved_maximum_holding_minutes: integer|null
+  reduce_only_required: bool
   triggered_rules: list[string]
-  risk_override_reason: string|null
-  gross_exposure_after: float
-  net_exposure_after: float
-  estimated_margin_after: float
+  rejection_reason: string|null
   risk_config_version: string
 ```
 
 Invariants:
 
 ```text
-all inputs and outputs reference the configured target_symbol only
-HALTED and REJECTED emit no exposure-increasing order intent
-abstention may preserve or reduce exposure but cannot increase it
-approved exposure respects all risk and exchange constraints
-order intents are idempotent
-wrong-symbol input forces HALTED or REJECTED
+approved_target_notional = approved_target_position_fraction * allocated_equity
+absolute approved target <= configured and instrument bounds
+REJECTED and HALTED cannot increase absolute exposure
+abstention cannot increase absolute exposure
+BROKEN reconciliation cannot increase absolute exposure
+expired approval cannot be executed
 ```
 
----
+The Risk Engine does not emit side, quantity, order type, limit price, or child orders.
 
-# 10. Model artifact contracts
+## 12. Execution boundary contracts
 
-## 10.1 RegimeModelArtifact.v1
+### 12.1 ExecutionPlan.v1
+
+Produced by the external execution system from `ApprovedTargetPosition.v1`.
+
+```yaml
+contract: ExecutionPlan.v1
+fields:
+  execution_plan_id: string
+  approval_id: string
+  deployment_id: string
+  target_symbol: BTC|ETH|SOL
+  instrument_id: string
+  current_reconciled_notional: decimal
+  target_notional: decimal
+  delta_notional: decimal
+  urgency: REDUCE_ONLY|NORMAL|EMERGENCY
+  idempotency_key: string
+  created_at: datetime_utc
+  status: CREATED|SUBMITTING|PARTIALLY_FILLED|FILLED|CANCELLED|FAILED|RECONCILIATION_REQUIRED
+```
+
+### 12.2 ExecutionReport.v1
+
+```yaml
+contract: ExecutionReport.v1
+fields:
+  execution_plan_id: string
+  approval_id: string
+  completed_at: datetime_utc|null
+  submitted_orders: list
+  fills: list
+  fees_paid: decimal
+  funding_paid: decimal
+  realised_slippage_bps: float|null
+  final_reconciled_position_notional: decimal|null
+  final_reconciled_position_fraction: float|null
+  reconciliation_status: RECONCILED|PENDING|BROKEN
+  failure_reason: string|null
+```
+
+## 13. Artifact contracts
+
+### 13.1 RegimeModelArtifact.v1
 
 ```yaml
 contract: RegimeModelArtifact.v1
 fields:
   model_id: string
   target_symbol: BTC|ETH|SOL
-  selected_model_family: string
-  selected_features: list[string]
-  preprocessing_pipeline: object
-  model_parameters: object
-  state_signatures: RegimeStateSignature.v1[]
-  state_alignment_metadata: object
-  feature_contract_version: string
   feature_set_hash: string
-  source_data_hash: string
+  scaler_state: RobustScalerState.v1
+  transition_matrix: object
+  emission_parameters: object
+  state_signatures: RegimeStateSignature.v1[]
+  seed_list: list[integer]
+  converged_seed_count: integer
+  seed_stability_metrics: object
   training_window: [datetime_utc, datetime_utc]
-  decision_interval: string
-  inner_validation_metrics: object
-  outer_evaluation_metrics: object
-  selection_score_version: string
+  inner_metrics: object
+  completed_outer_metrics: object
   code_commit: string
   dependency_lock_hash: string
   artifact_hash: string
 ```
 
-## 10.2 AllocatorModelArtifact.v1
+### 13.2 AllocatorConfigArtifact.v1
 
 ```yaml
-contract: AllocatorModelArtifact.v1
+contract: AllocatorConfigArtifact.v1
 fields:
-  model_id: string
   target_symbol: BTC|ETH|SOL
-  selected_model_family: string
-  policy_parameters: object
-  expert_contract_versions: map[string, string]
-  regime_model_id: string
-  action_space_version: string
-  cost_model_version: string
+  instrument_id: string
+  affinity_matrix: RegimeStrategyAffinityMatrix.v1
+  strategy_config: StrategyConfig.v1
+  exit_profiles: ExitProfile.v1[]
   training_window: [datetime_utc, datetime_utc]
-  decision_interval: string
-  inner_validation_metrics: object
-  outer_evaluation_metrics: object
-  selection_score_version: string
-  code_commit: string
-  dependency_lock_hash: string
-  artifact_hash: string
-```
-
-## 10.3 RiskConfigArtifact.v1
-
-```yaml
-contract: RiskConfigArtifact.v1
-fields:
-  target_symbol: BTC|ETH|SOL
-  risk_limits: RiskLimits.v1
-  exchange_constraints: ExchangeConstraints.v1
-  data_quality_rules: object
-  confidence_and_entropy_rules: object
-  kill_switch_rules: object
-  config_version: string
+  validation_metrics: object
   code_commit: string
   artifact_hash: string
 ```
 
-## 10.4 CompatibleArtifactSet.v1
+### 13.3 CompatibleArtifactSet.v1
 
 ```yaml
 contract: CompatibleArtifactSet.v1
 fields:
+  artifact_set_id: string
   deployment_id: string
   target_symbol: BTC|ETH|SOL
+  selected_instrument_id: string
+  selected_instrument_type: SPOT|PERPETUAL
+  instrument_selection_report_id: string
   regime_model_id: string
-  allocator_model_id: string
+  allocator_artifact_hash: string
   risk_config_version: string
   feature_contract_version: string
-  strategy_config_versions: map[string, string]
   cost_model_version: string
-  decision_interval: string
+  execution_adapter_version: string
+  decision_timing_version: string
+  code_commit: string
+  dependency_lock_hash: string
   compatibility_hash: string
 ```
 
-A production decision must record the exact `CompatibleArtifactSet.v1` used.
+A production deployment loads the set atomically. Partial artifact substitution is prohibited.
 
----
+## 14. Audit contract
 
-# 11. Audit contract
-
-## 11.1 DecisionAuditRecord.v1
+### 14.1 DecisionAuditRecord.v1
 
 ```yaml
 contract: DecisionAuditRecord.v1
 fields:
   decision_id: string
+  deployment_id: string
   as_of: datetime_utc
   target_symbol: BTC|ETH|SOL
-  deployment_id: string
-  source_dataset_version: string
-  source_data_hash: string
-  feature_contract_version: string
-  feature_set_hash: string
-  compatible_artifact_set: CompatibleArtifactSet.v1
-  feature_input_hash: string
+  instrument_id: string
+  compatible_artifact_set_id: string
+  capital_allocation: CapitalAllocation.v1
+  timing: DecisionTiming.v1
+  feature_frame: MarketFeatureFrame.v1
   regime_prediction: RegimePrediction.v1
   expert_signals: StrategyExpertSignal.v1[]
   allocation_proposal: AllocationProposal.v1
-  risk_decision: RiskDecision.v1
-  execution_acknowledgements: list
-  fills: list
   portfolio_state_before: PortfolioState.v1
+  operational_state: OperationalState.v1
+  approved_target: ApprovedTargetPosition.v1
+  execution_report: ExecutionReport.v1|null
   portfolio_state_after: PortfolioState.v1|null
+  record_hash: string
 ```
 
-The record must be immutable and sufficient to reproduce the analytical decision from pinned data, code, dependencies, model artifacts, and configuration.
+The record is immutable and sufficient to reproduce the analytical decision from pinned source data, code, dependencies, artifacts, and configurations.
