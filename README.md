@@ -20,6 +20,7 @@ If the perpetual has materially better net return/risk performance after fees, s
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — normative system design, model-selection procedure, instrument selection, module boundaries, training, deployment, and production roadmap.
 - [`CONTRACTS.md`](CONTRACTS.md) — implementable input/output schemas, units, invariants, timing definitions, artifacts, and audit records.
+- [`METHODOLOGY.md`](METHODOLOGY.md) — exact strategy-signal, performance-metric, cost-stress, and bootstrap formulas.
 - [`OPERATIONS.md`](OPERATIONS.md) — runtime state machine, security, monitoring thresholds, incident handling, promotion, and rollback.
 - [`crypto-history-loader/DATASETS.md`](https://github.com/SergejSchweizer/crypto-history-loader/blob/main/DATASETS.md) — upstream Gold dataset definitions.
 
@@ -93,7 +94,7 @@ Production V1 uses fixed economic horizons:
 | Momentum | 4–24 hours |
 | Trend | 1–7 days |
 
-Each expert emits direction, strength, confidence, expected holding time, and estimated cost.
+Each expert emits direction, strength, confidence, expected holding time, and estimated cost. Exact formulas are defined in `METHODOLOGY.md`.
 
 ### Module 2 — Deterministic Allocator
 
@@ -200,4 +201,4 @@ offline research
 → restricted production
 ```
 
-Promotion is always manual. Every production decision must be reproducible from immutable data, feature, model, allocator, risk, instrument, code, and dependency versions.
+Promotion is always manual. Every production decision must be reproducible from immutable data, feature, model, allocator, risk, instrument, code, dependency, methodology, and operations versions.
