@@ -1,6 +1,6 @@
-# Operations
+# Operations and Model Governance
 
-This document defines the Production V1 runtime, security, monitoring, incident, promotion and rollback requirements for one fixed linear BTC-perpetual deployment.
+This document defines Production V1 runtime behaviour, security, monitoring, incident handling, MLflow experiment tracking, Model Registry governance, promotion and rollback for one fixed linear BTC-perpetual deployment.
 
 ## 1. Operating principles
 
@@ -11,7 +11,7 @@ one decision timestamp = one logical decision
 one approval = at most one active execution plan
 isolated margin only
 one-way position mode only
-absolute effective leverage <= 1×
+absolute effective leverage <= 1x
 unknown state = no exposure increase
 reconciliation failure = no exposure increase
 artifact mismatch = halt
@@ -19,11 +19,9 @@ manual promotion only
 atomic rollback only
 ```
 
-The analytical and execution systems must remain independently restartable. Restarting either system must not create a duplicate decision, duplicate execution plan or duplicate protective order set.
+The analytical and execution systems remain independently restartable. Restarting either system must not create duplicate decisions, plans or protective orders.
 
 ## 2. Process topology
-
-A Production V1 deployment contains:
 
 ```text
 BTC market-data adapter
@@ -32,40 +30,39 @@ regime service
 deterministic expert service
 deterministic allocator
 risk service
-decision store
+decision and audit store
 BTC-perpetual execution service
 portfolio and margin reconciler
 monitoring and alerting
+MLflow Tracking Server and Model Registry
 ```
 
-These components may run in one process initially, but their contracts and persisted states must remain separate.
+Components may initially share a process, but contracts and persisted state remain separate.
 
 ## 3. Startup sequence
 
-Startup proceeds in this exact order:
+Startup proceeds in this order:
 
 1. load `DeploymentConfig.v1`;
 2. verify `target_symbol = BTC`;
 3. load current `CapitalAllocation.v1`;
-4. load `CompatibleArtifactSet.v1` atomically;
-5. verify the BTC linear-perpetual and BTC spot-reference specifications;
-6. verify code, dependency, feature, methodology, risk and operations hashes;
-7. connect market data in read-only mode;
-8. connect the exchange in read-only mode;
-9. verify the exchange instrument is the configured BTC linear perpetual;
-10. verify isolated margin mode;
-11. verify one-way position mode;
-12. set or verify maximum production leverage of 1×;
-13. verify reduce-only support;
-14. reconcile cash, margin, position, open orders and protective orders;
-15. verify mark price, index price, liquidation price and funding availability;
-16. verify system clock;
-17. validate `SmallAccountCapability.v1` for the current capital allocation;
-18. acquire the deployment leadership lock;
-19. enable analytical decisions;
-20. enable exposure-changing execution only after every previous check passes.
+4. resolve the approved MLflow champion deployment bundle;
+5. load `CompatibleArtifactSet.v1` atomically;
+6. verify BTC perpetual and spot-reference specifications;
+7. verify code, dependency, feature, methodology, risk, operations and artifact hashes;
+8. connect market data and exchange in read-only mode;
+9. verify the exact configured linear BTC perpetual;
+10. verify isolated margin, one-way mode and maximum production leverage of 1x;
+11. verify reduce-only support;
+12. reconcile cash, margin, position, open orders and protective orders;
+13. verify mark, index, liquidation and funding data;
+14. verify the system clock;
+15. validate `SmallAccountCapability.v1`;
+16. acquire the deployment leadership lock;
+17. enable analytical decisions;
+18. enable exposure-changing execution only after every prior check passes.
 
-Any failure before step 20 leaves the deployment in `SAFE_READ_ONLY` or `HALTED`, according to severity.
+Any failure leaves the deployment in `SAFE_READ_ONLY` or `HALTED`.
 
 ## 4. Runtime state machines
 
@@ -82,23 +79,19 @@ DEGRADED
 HALTED
 ```
 
-Allowed transitions:
-
 ```text
-STARTING → SAFE_READ_ONLY
-SAFE_READ_ONLY → READY
-READY → DECIDING
-DECIDING → READY
-DECIDING → EXECUTING
-EXECUTING → RECONCILING
-RECONCILING → READY
-any state → DEGRADED
-any state → HALTED
-DEGRADED → SAFE_READ_ONLY
-HALTED → SAFE_READ_ONLY only after manual acknowledgement
+STARTING -> SAFE_READ_ONLY
+SAFE_READ_ONLY -> READY
+READY -> DECIDING
+DECIDING -> READY|EXECUTING
+EXECUTING -> RECONCILING
+RECONCILING -> READY
+any state -> DEGRADED|HALTED
+DEGRADED -> SAFE_READ_ONLY
+HALTED -> SAFE_READ_ONLY only after manual acknowledgement
 ```
 
-There is no direct `HALTED → READY` transition.
+There is no direct `HALTED -> READY` transition.
 
 ### 4.2 Decision states
 
@@ -116,11 +109,9 @@ FAILED
 EXPIRED
 ```
 
-Transitions are append-only and persisted. A state cannot move backwards.
+Transitions are append-only and never move backwards.
 
 ## 5. Exactly-once semantics
-
-### 5.1 Deterministic decision ID
 
 ```text
 decision_id = hash(
@@ -132,19 +123,7 @@ decision_id = hash(
 )
 ```
 
-The same logical decision receives the same ID after restart or retry.
-
-### 5.2 Decision lock
-
-Before creating a decision, acquire a distributed lock on:
-
-```text
-deployment_id + as_of
-```
-
-Lock loss before decision persistence aborts the decision. Lock loss after approval blocks new execution until reconciliation.
-
-### 5.3 Execution idempotency
+A distributed lock is acquired on `deployment_id + as_of`. Lock loss before persistence aborts the decision; lock loss after approval blocks new execution until reconciliation.
 
 ```text
 execution_idempotency_key = hash(
@@ -154,11 +133,7 @@ execution_idempotency_key = hash(
 )
 ```
 
-The execution service rejects a second active plan with the same key. Exchange client-order IDs derive from the execution plan and child-order sequence.
-
-### 5.4 Protective-order idempotency
-
-The stop and take-profit set uses:
+The execution service rejects a second active plan with the same key.
 
 ```text
 protective_order_set_id = hash(
@@ -168,178 +143,95 @@ protective_order_set_id = hash(
 )
 ```
 
-At most one active protective-order set may exist for the reconciled net position.
+At most one active protective-order set exists for the reconciled net position.
 
 ## 6. Hourly decision schedule
 
 At every scheduled UTC hour:
 
-1. wait until the final source M1 bucket is closed;
-2. verify BTC spot and BTC perpetual source watermarks;
-3. verify system clock;
-4. build and persist `MarketFeatureFrame.v1`;
-5. run Module 1;
-6. run all enabled experts;
-7. run Module 2;
-8. read current reconciled position, margin and liquidation state;
-9. run Module 3;
-10. persist `DecisionAuditRecord.v1` without execution report;
-11. send an unexpired approval to execution;
-12. create at most one execution plan;
-13. reconcile fills and position;
-14. activate or replace reduce-only protective orders;
-15. append execution and portfolio results to the audit chain.
+1. wait for the final source M1 bucket to close;
+2. verify BTC spot and perpetual watermarks and clock;
+3. build and persist `MarketFeatureFrame.v1`;
+4. run the regime estimator and all enabled experts;
+5. run the allocator;
+6. read reconciled position, margin and liquidation state;
+7. run the Risk Engine;
+8. persist `DecisionAuditRecord.v1`;
+9. send an unexpired approval to execution;
+10. create at most one execution plan;
+11. reconcile fills and position;
+12. activate or replace reduce-only protective orders;
+13. append execution and portfolio results to the audit chain.
 
-A late decision does not shift the schedule. It expires and the next scheduled hour creates a new decision.
+A late decision expires; it does not shift the schedule.
 
-## 7. Service-level objectives and automatic actions
+## 7. Service objectives and automatic actions
 
 All thresholds are versioned in `OperationsConfig.v1` or `RiskLimits.v1`.
 
 | Condition | Default trigger | Automatic action |
 |---|---:|---|
-| BTC market-data bucket delay | > 120 seconds | reject exposure increase for current decision |
-| BTC market-data bucket delay | > 600 seconds | enter `DEGRADED`; reduce-only execution |
-| Required BTC spot reference unavailable | any required snapshot | feature `FAIL`; no exposure increase |
-| Feature computation duration | > 30 seconds | expire current decision |
-| Decision age at execution | > 60 seconds | reject exposure increase |
-| Source gap | any gap > 180 minutes | `HALTED` |
-| Feature hash mismatch | any occurrence | `HALTED` |
-| Artifact compatibility mismatch | any occurrence | startup failure or `HALTED` |
-| Non-BTC symbol or wrong instrument | any occurrence | `HALTED` |
-| Contract is not linear perpetual | any occurrence | `HALTED` |
-| Margin mode not isolated | any occurrence | cancel exposure-increasing orders; `HALTED` |
-| Position mode not one-way | any occurrence | cancel exposure-increasing orders; `HALTED` |
-| Effective leverage configuration > 1× | any occurrence | startup failure or `HALTED` |
-| Small-account capability | `FAIL` | startup failure for that capital allocation |
-| Funding data stale | beyond configured maximum | no exposure increase |
-| Absolute funding rate | above risk limit | reduce or reject target |
-| Mark/index divergence | above warning threshold | no exposure increase |
-| Mark/index divergence | above halt threshold | reduce-only; `HALTED` |
-| Liquidation buffer | below warning threshold | reduce-only; clip target |
-| Liquidation buffer | below hard limit | emergency reduction; `HALTED` |
-| Portfolio reconciliation | `BROKEN` | cancel non-reduce-only orders; reduce-only mode |
-| Reconciliation broken duration | > 300 seconds | `HALTED` |
-| Pending execution-plan age | > 120 seconds | stop new plans; reconcile |
-| Oldest exchange-order age | > configured TTL | cancel and reconcile |
-| Regime entropy | above risk limit | abstain; no exposure increase |
-| Maximum regime probability | below risk limit | abstain; no exposure increase |
-| Daily loss | limit reached | cancel exposure-increasing orders; reduce or flatten; `HALTED` |
-| Maximum drawdown | limit reached | reduce-only; `HALTED` |
-| Kill switch | active | cancel open orders; emergency reduction or flatten; `HALTED` |
-| Clock offset | > 500 milliseconds | exposure increase disabled |
-| Realised slippage | > 2× expected for 3 plans | enter `DEGRADED`; reduce maximum target change |
-| Realised cost-model error | above tolerance | block promotion; alert |
+| Market-data bucket delay | >120 seconds | reject exposure increase |
+| Market-data bucket delay | >600 seconds | `DEGRADED`, reduce-only |
+| Required spot reference unavailable | any required snapshot | feature `FAIL` |
+| Feature computation duration | >30 seconds | expire decision |
+| Decision age at execution | >60 seconds | reject exposure increase |
+| Source gap | >180 minutes | `HALTED` |
+| Feature or artifact hash mismatch | any | `HALTED` |
+| Wrong symbol, instrument or contract type | any | `HALTED` |
+| Margin mode not isolated | any | cancel increasing orders, `HALTED` |
+| Position mode not one-way | any | cancel increasing orders, `HALTED` |
+| Effective leverage configuration >1x | any | startup failure or `HALTED` |
+| Small-account capability | `FAIL` | startup failure |
+| Funding data stale | beyond limit | no exposure increase |
+| Absolute funding rate | above limit | reduce or reject |
+| Mark/index divergence | warning threshold | no exposure increase |
+| Mark/index divergence | halt threshold | reduce-only, `HALTED` |
+| Liquidation buffer | warning threshold | clip, reduce-only |
+| Liquidation buffer | hard limit | emergency reduction, `HALTED` |
+| Reconciliation | `BROKEN` | cancel non-reduce-only orders |
+| Reconciliation broken duration | >300 seconds | `HALTED` |
+| Pending execution-plan age | >120 seconds | stop new plans, reconcile |
+| Exchange-order age | above TTL | cancel and reconcile |
+| Regime entropy | above limit | abstain |
+| Maximum regime probability | below limit | abstain |
+| Daily loss or drawdown | limit reached | reduce or flatten, `HALTED` |
+| Kill switch | active | cancel, emergency reduce or flatten |
+| Clock offset | >500 milliseconds | disable exposure increase |
+| Realised slippage | >2x expected for 3 plans | `DEGRADED`, reduce target-change cap |
+| Cost-model error | above tolerance | block promotion and alert |
 
-Emergency reduction and flatten policies are deterministic and instrument-specific. They are never inferred by a model.
+Emergency reduction and flattening are deterministic and never inferred by a model.
 
 ## 8. Safe degradation
 
-### 8.1 Preserve or reduce only
+Feature failure, inference failure, allocator abstention, risk rejection, high entropy, stale capital or cost state, mark/index divergence, insufficient liquidation buffer, broken reconciliation, execution connectivity loss and decision expiry allow only preservation or reduction of absolute exposure.
 
-The following conditions allow only preservation or reduction of absolute exposure:
+A target of zero is not a confirmed flat position. The system may claim flat only after exchange reconciliation.
 
-- feature failure;
-- model inference failure;
-- allocator abstention;
-- risk rejection;
-- high entropy;
-- low maximum regime probability;
-- stale capital allocation;
-- stale cost or funding state;
-- mark/index divergence;
-- insufficient liquidation buffer;
-- broken reconciliation;
-- execution connectivity loss;
-- decision expiry.
+Production V1 has no fallback asset, fallback spot execution, fallback perpetual contract or automatic fallback model.
 
-### 8.2 Flat target is not confirmed flat position
+## 9. Execution requirements
 
-When the exchange is disconnected or the position is unresolved, the system may record a target of zero but must not claim the position is flat until reconciliation confirms it.
-
-### 8.3 No hidden fallback market or model
-
-Production V1 has:
-
-```text
-no fallback asset
-no fallback spot execution
-no fallback perpetual contract
-no automatic fallback model
-```
-
-Failure leads to abstention and deterministic risk reduction.
-
-## 9. BTC-perpetual execution requirements
-
-### 9.1 Quantity conversion
-
-Execution converts approved notional to contract quantity using the current validated reference price, contract multiplier and quantity step. Quantity is rounded toward zero.
-
-### 9.2 Target delta
+Execution converts approved notional into exchange-valid quantity using reference price, contract multiplier and quantity step, rounding towards zero.
 
 ```text
 delta_notional = approved_target_notional - reconciled_current_notional
 ```
 
-Execution must not infer a target from signals directly.
+Execution never infers a target from raw signals. Protective exits and degradation-driven reductions use reduce-only. A reduce-only rejection is a reconciliation event, not permission to send an unrestricted replacement.
 
-### 9.3 Reduce-only usage
-
-All protective exits and all degradation-driven reductions use reduce-only when supported. A reduce-only rejection is a reconciliation event, not a reason to send an unrestricted replacement blindly.
-
-### 9.4 One-way position mode
-
-The exchange account must hold one net BTC-perpetual position. Separate hedge-mode long and short positions are prohibited.
-
-### 9.5 Isolated margin
-
-Only the configured deployment margin allocation may support the position. Cross-margin dependence on unrelated account assets is prohibited.
-
-### 9.6 Funding
-
-The execution and portfolio services record:
-
-- current funding rate;
-- next funding timestamp;
-- position held across each funding event;
-- realised funding cashflow;
-- cumulative funding by decision and position episode.
+The account holds one net position in one-way mode and uses isolated margin. Funding observations, held position, realised funding cash flow and cumulative funding are recorded for every funding event.
 
 ## 10. Security
 
-### 10.1 Exchange API key
+Production API keys must have trading permission only, no withdrawal permission, sub-account restriction, IP allow-listing when available and no unnecessary instrument permissions.
 
-Production keys must:
+Secrets come from an approved secret manager and are prohibited in Git, model artifacts, images, plaintext configuration, notebooks and logs.
 
-- have trading permission only;
-- have no withdrawal permission;
-- be restricted to the required account or sub-account;
-- use an IP allow-list when supported;
-- have no permission for unrelated instruments when the exchange supports instrument restrictions;
-- be rotated on a documented schedule and after suspected exposure.
+Paper, canary and production use separate credentials and preferably separate accounts or sub-accounts. Promotion, capital changes, risk changes and kill-switch release require authenticated, auditable operator actions.
 
-### 10.2 Secret storage
-
-Secrets must come from an approved secret manager. They must not be stored in source control, model artifacts, Docker images, plaintext configuration, notebooks or logs.
-
-### 10.3 Environment separation
-
-Use separate credentials and, where possible, separate accounts or sub-accounts for:
-
-```text
-paper
-canary
-production
-```
-
-Paper or canary processes must not possess production credentials.
-
-### 10.4 Access control
-
-Manual promotion, capital changes, risk-limit changes and kill-switch release require authenticated and auditable operator actions.
-
-## 11. Structured logging and audit
+## 11. Logging and audit
 
 Every service emits:
 
@@ -356,65 +248,61 @@ result code
 incident_id when present
 ```
 
-Logs must not contain credentials or secret values.
+Logs contain no credentials. `DecisionAuditRecord.v1` is immutable; corrections append a new record referencing the original hash.
 
-`DecisionAuditRecord.v1` is immutable. Corrections are appended as new records referencing the original hash.
+Every runtime decision also records the exact MLflow model and bundle identity:
 
-## 12. Monitoring dashboards
+```text
+mlflow_registered_model_name
+mlflow_model_version
+mlflow_model_alias_at_decision_time
+source_run_id
+artifact_sha256
+output_contract_version
+state_schema_version
+```
 
-### 12.1 Data and feature dashboard
+## 12. Monitoring
 
-- BTC spot and perpetual watermarks;
-- gaps and duplicates;
+### Data and features
+
+- spot and perpetual watermarks, gaps and duplicates;
 - funding and open-interest ages;
-- core-feature validity;
-- feature latency;
+- feature validity and latency;
 - historical/live parity;
 - feature-hash mismatch count.
 
-### 12.2 Regime dashboard
+### Regime model
 
-- three current probabilities;
-- 4-hour forward probabilities;
-- normalized entropy;
-- maximum probability;
+- current and four-hour probabilities;
+- normalised entropy and maximum probability;
 - state occupancy and duration;
 - transition-matrix drift;
 - state-signature distance;
 - abstention rate.
 
-### 12.3 Strategy and allocator dashboard
+### Strategy and allocation
 
-- expert directions, strengths and confidence;
-- contribution weights;
-- consensus direction;
-- cash weight;
-- regime certainty;
-- volatility multiplier;
-- preliminary target fraction;
-- dominant expert and exit profile;
-- disagreement frequency.
+- expert direction, strength and confidence;
+- contribution weights and disagreement;
+- consensus direction and cash weight;
+- regime certainty and volatility multiplier;
+- preliminary target and selected exit profile.
 
-### 12.4 BTC-perpetual risk and execution dashboard
+### Risk and execution
 
-- current and approved position fraction;
-- current and approved notional;
+- current and approved fraction and notional;
 - isolated margin use;
-- mark and index prices;
-- mark/index divergence;
-- liquidation price and buffer;
-- funding rate and realised funding;
+- mark/index divergence and liquidation buffer;
+- funding and realised funding;
 - clipping, rejection and halt counts;
-- daily loss and drawdown;
-- turnover;
-- pending plans and orders;
-- fill latency;
-- realised fees and slippage;
+- daily loss, drawdown and turnover;
+- order age, fill latency, fees and slippage;
 - reconciliation status.
 
 ## 13. Alerts and runbooks
 
-Every alert definition contains:
+Each alert defines:
 
 ```yaml
 alert_id: string
@@ -427,133 +315,412 @@ owner: string
 acknowledgement_deadline_seconds: integer
 ```
 
-Critical alerts include:
-
-- wrong asset or instrument;
-- non-linear or changed contract semantics;
-- margin-mode or position-mode drift;
-- leverage above 1×;
-- artifact incompatibility;
-- broken reconciliation beyond threshold;
-- missing liquidation price while a position is open;
-- liquidation-buffer breach;
-- daily-loss or drawdown limit;
-- kill switch;
-- duplicate execution attempt;
-- unrecognized BTC-perpetual position;
-- inability to cancel exposure-increasing orders;
-- authentication or secret failure.
+Critical alerts include wrong instrument, changed contract semantics, margin or position-mode drift, leverage above 1x, artifact incompatibility, prolonged broken reconciliation, missing liquidation price, liquidation-buffer breach, loss-limit breach, kill switch, duplicate execution, unrecognised position, inability to cancel increasing orders and secret failure.
 
 ## 14. Deployment environments
 
-### 14.1 Historical replay
+```text
+historical replay
+-> live feature shadow
+-> full decision shadow
+-> paper execution
+-> small-capital canary
+-> restricted production
+```
 
-Uses production decision code with historical adapters and reproduces stored outer-fold decisions from immutable artifacts.
+Historical replay uses production decision code with historical adapters. Feature shadow has no execution. Decision shadow persists full decisions but sends no approvals. Paper runs the production execution state machine against a paper venue or deterministic simulator. Canary uses a dedicated small allocation, strict loss limits and reduced target changes. Restricted production retains conservative limits and never exceeds absolute fraction 1.0.
 
-### 14.2 Live feature shadow
+## 15. MLflow role and infrastructure
 
-Runs live BTC spot and BTC-perpetual adapters and the feature service without execution.
+MLflow is the experiment and model control plane. It does not replace point-in-time feature generation, nested walk-forward splitting, persistent state mapping, financial backtesting, bootstrap tests, the Risk Engine or runtime state storage.
 
-### 14.3 Full decision shadow
+Recommended architecture:
 
-Runs all three modules and persists decisions. Execution receives nothing.
+```text
+GitHub
+    source code, contracts, configs and tests
 
-### 14.4 Paper execution
+MLflow Tracking Server
+    experiments, runs, parameters, metrics, lineage and registry metadata
 
-Runs the production BTC-perpetual execution state machine against a paper environment or deterministic simulator.
+PostgreSQL
+    MLflow backend store
 
-### 14.5 Small-capital canary
+MinIO or S3-compatible storage
+    run and model artifacts
 
-Uses a dedicated allocation in the order of €1,000 equivalent, subject to `SmallAccountCapability.v1`, strict loss limits and materially reduced target-change limits.
+Runtime PostgreSQL
+    filtered probabilities, decisions, positions and audit
 
-### 14.6 Restricted production
+Parquet or analytical database
+    historical market data and feature frames
+```
 
-Uses production credentials but retains conservative exposure, turnover and loss limits. Production V1 never exceeds absolute position fraction 1.0.
+The MLflow backend and runtime database are logically separated.
 
-## 15. Promotion
+## 16. MLflow experiment taxonomy
 
-Promotion is manual and atomic.
+Use separate experiments for separate causal questions:
 
-A challenger package contains:
+```text
+btc-regime/00-data-and-feature-validation
+btc-regime/10-standalone-exit-optimisation
+btc-regime/20-regime-model-selection
+btc-regime/30-regime-incremental-value
+btc-regime/40-regime-dependent-exits
+btc-regime/50-l2-microstructure-overlay
+btc-regime/60-learned-allocator
+btc-regime/90-shadow-paper-canary
+```
 
-- `BTCLinearPerpetualSpec.v1`;
-- `BTCSpotReferenceSpec.v1`;
-- `SmallAccountCapability.v1`;
-- `RegimeModelArtifact.v1`;
-- `AllocatorConfigArtifact.v1`;
-- risk and operations configurations;
-- compatible feature, cost and execution versions;
-- historical, shadow, paper and canary reports;
-- signed approval record.
+Do not place all research in one experiment.
 
-Promotion requires:
+## 17. MLflow run hierarchy
 
-- all hard research gates;
-- no unresolved critical incidents;
-- historical/live feature parity;
-- acceptable realised cost and funding error;
-- successful paper margin and reconciliation behaviour;
-- canary operation within loss, sizing and incident limits;
-- tested rollback package;
-- operator approval.
+A parent run represents one reproducible experiment definition: candidate family, dataset snapshot, outer fold, search space, costs and code commit.
 
-A performance score alone cannot promote a challenger.
+Child runs represent deterministic seeds, inner folds, parameter combinations, exit profiles, cost scenarios, placebos and bootstrap summaries.
 
-## 16. Rollback
+```text
+parent: candidate x outer_fold
+    |-- child: seed
+    |-- child: inner_fold x parameter combination
+    |-- child: BASE cost
+    |-- child: ELEVATED cost
+    `-- child: SEVERE cost
+```
 
-Rollback replaces the complete `CompatibleArtifactSet.v1`.
+Outer-test results are logged only after inner selection is complete and frozen.
 
-Partial rollback is prohibited. The BTC-perpetual specification, BTC spot reference, model, scaler, affinity matrix, strategy configuration, cost model, risk configuration, operations configuration and execution adapter remain one compatible unit.
+## 18. Required MLflow metadata
 
-Rollback sequence:
+### Tags
 
-1. disable exposure increases;
-2. reconcile current BTC-perpetual position and margin;
-3. cancel invalid or stale orders;
-4. preserve valid reduce-only protective orders or replace them deterministically;
-5. activate the previous signed compatible set;
-6. verify hashes, instrument, margin mode and position mode;
-7. run a dry decision without execution;
-8. resume in `SAFE_READ_ONLY`;
-9. require manual transition to `READY`.
+```text
+project = regime-strategy-selector
+target_symbol = BTC
+traded_instrument_type = LINEAR_PERPETUAL
+run_role = INNER_TRAIN|INNER_VALIDATION|OUTER_TEST|PLACEBO|SHADOW|PAPER|CANARY
+candidate_role = BASELINE|CHAMPION|CHALLENGER
+model_family = string
+strategy_id = TREND|MOMENTUM|MEAN_REVERSION|ALLOCATOR|NONE
+state_schema_version = string
+feature_contract_version = string
+output_contract_version = string
+experiment_design_version = string
+validation_status = PASS|FAIL
+alignment_status = PASS|FAIL|NOT_APPLICABLE
+promotion_eligible = true|false
+```
 
-If the previous set is unavailable or invalid, remain halted.
+### Common parameters
 
-## 17. Backup and recovery
+```text
+outer_fold_id
+inner_fold_id
+training_start
+training_end
+validation_start
+validation_end
+test_start
+test_end
+embargo_hours
+purge_hours
+decision_interval_minutes
+primary_horizon_hours
+stress_horizon_hours
+random_seed
+code_commit
+dependency_lock_hash
+dataset_name
+dataset_version
+dataset_digest
+feature_set_hash
+risk_config_version
+cost_model_version
+```
 
-Persist and back up:
+### Model parameters
 
-- deployment and capital configurations;
-- compatible artifact sets;
-- model and allocator artifacts;
-- BTC-perpetual and reference-spot specifications;
-- decision store;
-- execution plans and exchange acknowledgements;
-- margin and portfolio reconciliation snapshots;
-- immutable audit records;
-- incident records.
+```text
+model_family
+model_implementation_version
+n_states
+covariance_type
+n_initialisations
+convergence_tolerance
+maximum_iterations
+minimum_state_occupancy
+maximum_state_alignment_distance
+scaler_type
+scaler_version
+```
 
-Recovery testing must show that a clean process can reconstruct analytical state and reconcile the live BTC-perpetual position without creating a duplicate plan.
+### Exit and allocator parameters
 
-## 18. Operations readiness checklist
+```text
+strategy_id
+exit_search_space_version
+stop_atr_multiple
+take_profit_atr_multiple
+time_stop_hours
+trailing_stop_enabled
+selection_rule_version
+affinity_method_version
+minimum_cash_fraction
+minimum_consensus_evidence
+minimum_direction_dominance
+target_volatility_annual
+volatility_floor
+```
 
-Production activation requires:
+Tags identify semantics; they do not replace metrics.
 
-- no-withdrawal production API key;
-- secret-manager integration;
-- verified linear BTC-perpetual contract;
-- isolated margin and one-way mode enforcement;
-- verified 1× leverage cap;
-- passing small-account capability;
-- deterministic decision and idempotency keys;
-- distributed decision lock;
-- persisted decision and execution state machines;
-- position, margin and protective-order reconciliation;
-- mark, index, liquidation and funding monitoring;
-- tested kill switch and emergency reduction;
-- concrete alerts and runbooks;
-- dashboards for data, model, allocation, risk and execution;
-- tested backup and recovery;
-- tested atomic rollback;
-- completed paper and canary stages;
-- named operational owner.
+## 19. MLflow metrics
+
+Prefix metrics by scope:
+
+```text
+train/
+inner_validation/
+outer_test/
+bootstrap/
+cost_base/
+cost_elevated/
+cost_severe/
+shadow/
+paper/
+canary/
+```
+
+### Statistical regime metrics
+
+```text
+oos_predictive_log_likelihood
+one_state_log_likelihood_difference
+converged_seed_count
+stable_seed_count
+minimum_state_occupancy
+maximum_state_occupancy
+minimum_median_state_duration_hours
+maximum_median_state_duration_hours
+maximum_seed_alignment_distance
+maximum_fold_alignment_distance
+mean_normalised_entropy
+entropy_p95
+mean_maximum_probability
+transition_matrix_stability
+state_signature_stability
+invalid_probability_count
+```
+
+### Economic metrics
+
+```text
+net_return
+annualised_net_return
+net_calmar
+net_sharpe
+net_sortino
+maximum_drawdown
+cvar_95_loss
+turnover
+trade_count
+win_rate
+profit_factor
+average_trade_net_return
+median_trade_net_return
+maximum_positive_pnl_fold_contribution
+profitable_fold_fraction
+```
+
+### Exit robustness
+
+```text
+neighbourhood_score_mean
+neighbourhood_score_std
+neighbourhood_worst_score
+parameter_sensitivity_rank
+score_relative_to_inner_best
+```
+
+### Candidate versus baseline
+
+```text
+calmar_difference
+net_return_difference
+maximum_drawdown_difference
+cvar_95_loss_difference
+turnover_difference
+outer_fold_win_fraction
+paired_bootstrap_calmar_ci_lower
+paired_bootstrap_calmar_ci_upper
+paired_bootstrap_net_return_ci_lower
+paired_bootstrap_net_return_ci_upper
+```
+
+### Execution and L2
+
+```text
+expected_slippage_bps
+realised_slippage_bps
+spread_cost_bps
+entry_adverse_selection_bps
+entry_delay_minutes
+no_new_entry_fraction
+liquidity_rejection_fraction
+stop_out_within_1h_fraction
+```
+
+## 20. Dataset lineage and artifacts
+
+MLflow stores immutable references and hashes, not the full historical lake.
+
+Every run logs dataset name, version, URI, digest, schema hash, source-data hash, feature-set hash, build commit, coverage interval, row count, symbol and exchange. A mutable path such as `latest.parquet` is insufficient.
+
+Required artifacts:
+
+```text
+data and splits
+- dataset_manifest.json
+- feature_schema.json
+- feature_order.json
+- walk_forward_splits.json
+- point_in_time_validation_report.json
+- missingness_report.json
+
+regime model
+- raw_model.bin
+- scaler.json
+- transition_matrix.json
+- initial_state_probabilities.json
+- state_signatures.json
+- state_mapping.json
+- alignment_report.json
+- model_signature.json
+- probability_contract.json
+
+strategy and exits
+- strategy_config.json
+- exit_search_space.json
+- selected_exit_profile.json
+- exit_surface.parquet
+- exit_robustness_report.json
+- standalone_strategy_report.json
+
+economic evaluation
+- fold_metrics.parquet
+- equity_curve.parquet
+- trade_ledger.parquet
+- cost_breakdown.parquet
+- bootstrap_report.json
+- placebo_report.json
+- cost_stress_report.json
+- benchmark_comparison.json
+
+deployment
+- deployment_manifest.json
+- golden_prediction_inputs.parquet
+- golden_prediction_outputs.parquet
+- runtime_config.json
+- risk_config.json
+- affinity_matrix.json
+- exit_profile_set.json
+- dependency_lock.txt
+```
+
+## 21. Common MLflow model wrapper
+
+Every promotable regime model is packaged behind one common MLflow PyFunc-compatible interface. The wrapper owns feature validation and ordering, scaling, raw inference, filtered probabilities, four-hour projection, persistent-state mapping, canonical ordering and output validation.
+
+The public output is always `RegimePrediction.v1`.
+
+Required invariants:
+
+```text
+all probabilities are finite and in [0,1]
+current and forward vectors each sum to 1
+state order equals the registered persistent-state schema
+only filtered point-in-time probabilities are returned
+feature and artifact hashes match
+```
+
+## 22. Model Registry
+
+Registered models:
+
+```text
+btc-regime-estimator
+btc-regime-deployment-bundle
+```
+
+`btc-regime-estimator` may contain compatible versions from diagonal or full Gaussian HMMs, HSMMs, Student-t HMMs or Markov-switching autoregressions.
+
+The deployment bundle contains or references the exact model version, scaler, feature contract, state schema and mapping, affinity matrix, strategy configuration, exit profiles, risk configuration, cost model, timing policy, code commit and dependency lock.
+
+Production loads the deployment bundle and never independently selects the latest component versions.
+
+Every registered version is tagged with source run, model family and implementation version, feature/output/state/mapping versions, strategy and exit versions, affinity/risk/cost versions, dataset digest, code commit, dependency hash and statistical, economic, shadow, paper and canary status.
+
+## 23. Aliases, promotion and rollback
+
+Aliases point to immutable versions:
+
+```text
+@champion
+@challenger
+@shadow
+@rollback
+```
+
+Runtime reference:
+
+```text
+models:/btc-regime-deployment-bundle@champion
+```
+
+Promotion sequence:
+
+```text
+new immutable version
+-> @challenger
+-> @shadow
+-> paper validation
+-> canary validation
+-> previous @champion becomes @rollback
+-> new version becomes @champion
+```
+
+Every alias change records actor, timestamp, reason, source version, target version and evidence report.
+
+MLflow stores evidence but does not decide promotion. The project promotion service requires statistical, economic and alignment passes, outer-test reports, paired bootstrap evidence, cost-stress pass, shadow, paper and canary pass, and manual approval. A higher point estimate alone is insufficient.
+
+Rollback disables exposure increases, reconciles the position and orders, activates the previous complete signed bundle, verifies hashes and instrument state, runs a dry decision, resumes in `SAFE_READ_ONLY` and requires manual transition to `READY`. Partial rollback is prohibited.
+
+## 24. Runtime state is not a model artifact
+
+The Model Registry must not store `last_processed_as_of`, current probabilities, positions, orders, drawdown or daily loss. These belong in the runtime state and audit database.
+
+## 25. Reproducibility, retention and access
+
+Before registration:
+
+- save/load preserves output;
+- identical input and artifact reproduce probabilities;
+- golden prediction vectors match tolerance;
+- wrong feature order or hash fails;
+- unknown state mapping fails;
+- invalid probability sums fail;
+- the dependency environment is reconstructable.
+
+Registered model versions, outer-test reports, dataset digests and code commits are immutable. Failed runs are retained for audit and multiple-testing control. Promoted or previously promoted artifacts are not deleted while referenced.
+
+The Tracking Server requires authentication and network restriction. Research workers may create runs but cannot move `@champion`; alias movement requires elevated permission and is auditable.
+
+## 26. Backup, recovery and readiness
+
+Back up deployment and capital configurations, compatible bundles, model and allocator artifacts, instrument specifications, decision state, execution plans, exchange acknowledgements, reconciliation snapshots, audit and incident records.
+
+Recovery testing must reconstruct analytical state and reconcile the live position without duplicate execution.
+
+Production activation requires no-withdrawal credentials, secret management, verified contract semantics, isolated margin and one-way enforcement, 1x leverage cap, small-account capability, idempotency and locking, persisted state machines, reconciliation, mark/index/liquidation/funding monitoring, tested kill switch, alerts and runbooks, dashboards, backup and recovery, atomic rollback, completed paper and canary stages, and a named operational owner.
