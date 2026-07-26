@@ -2,42 +2,48 @@
 
 ## 1. Purpose
 
-`regime-strategy-selector` produces one risk-controlled target position for exactly one configured crypto asset:
+`regime-strategy-selector` produces one risk-controlled target position for one fixed Production V1 market:
 
 ```text
-target_symbol ∈ {BTC, ETH, SOL}
+target_symbol = BTC
+traded_instrument_type = LINEAR_PERPETUAL
+margin_mode = ISOLATED
+position_mode = ONE_WAY
 ```
 
-A deployment is bound to exactly one traded instrument:
+One exchange-specific linear BTC perpetual is the only tradable instrument. BTC spot is an information and benchmark market only. Production V1 does not emit spot, ETH, SOL, options, inverse-perpetual or dated-futures orders.
+
+An external capital service assigns the deployment:
 
 ```text
-selected_instrument_type ∈ {SPOT, PERPETUAL}
+allocated_equity
+max_loss_budget
+max_margin_budget
 ```
 
-Same-asset spot and perpetual data may both be used as information, but only the selected instrument may be traded.
+Exact schemas are defined in [`CONTRACTS.md`](CONTRACTS.md), formulas in [`METHODOLOGY.md`](METHODOLOGY.md), and runtime rules in [`OPERATIONS.md`](OPERATIONS.md).
 
-The system does not allocate account capital across BTC, ETH, and SOL. An external capital service assigns each deployment an immutable `allocated_equity`, `max_loss_budget`, and `max_margin_budget`.
-
-Exact schemas are in [`CONTRACTS.md`](CONTRACTS.md), formulas in [`METHODOLOGY.md`](METHODOLOGY.md), and runtime rules in [`OPERATIONS.md`](OPERATIONS.md).
-
-## 2. Production V1 scope
+## 2. Normative Production V1 scope
 
 | Concern | Production V1 rule |
 |---|---|
-| Asset | exactly one of BTC, ETH, SOL |
+| Asset | BTC only |
+| Trading instrument | one configured linear BTC perpetual |
+| Reference market | configured BTC spot market, information only |
 | Decision interval | 1 hour |
 | Primary horizon | 4 hours |
 | Stress horizon | 1 day |
 | Regime model | Gaussian HMM, diagonal covariance, 3 states |
 | Regime features | fixed five-feature vector |
-| Strategy experts | deterministic trend, momentum, mean reversion |
+| Strategy experts | deterministic trend, momentum and mean reversion |
 | Allocator | deterministic probability-weighted mapping |
-| Position | one signed net position |
-| Exit | one stop, one take profit, one time stop |
-| Instruments | eligible spot and perpetual candidates |
-| Leverage | absolute position fraction no greater than 1.0 |
+| Position | one signed net BTC-perpetual position |
+| Exit | one stop, one take profit and one time stop |
+| Margin mode | isolated |
+| Position mode | one-way |
+| Maximum effective leverage | 1× |
 | Promotion | manual and atomic |
-| Bandits/RL | research only |
+| Bandits and RL | research only |
 
 Production V1 has one learned runtime component: Module 1. Module 2 and Module 3 are deterministic.
 
@@ -45,11 +51,12 @@ Production V1 has one learned runtime component: Module 1. Module 2 and Module 3
 
 ```text
 gold.market.history_full.m1
-            │ filter symbol == target_symbol
+            │ filter symbol == BTC
+            │ validate BTC spot and BTC perpetual source rows
             ▼
  point-in-time feature service
             │
-            ├── training targets, offline only
+            ├── offline training targets
             ├── trend expert
             ├── momentum expert
             └── mean-reversion expert
@@ -63,117 +70,138 @@ gold.market.history_full.m1
  Module 3: Deterministic Risk Engine
             │ ApprovedTargetPosition.v1
             ▼
- external execution system
+ external BTC-perpetual execution system
             ▼
- orders, fills, cancels, reconciliation
+ orders, fills, protective orders and reconciliation
 ```
 
-The analytical repository stops at `ApprovedTargetPosition.v1`. Order type, price, quantity, slicing, maker/taker behaviour, retries, and cancel/replace belong only to execution.
+The analytical repository stops at `ApprovedTargetPosition.v1`. Order side, quantity, order type, child-order schedule, maker/taker behaviour, retries and cancel/replace belong only to execution.
 
-## 4. Units
+## 4. Market roles
 
-### 4.1 Target position fraction
+### 4.1 Trading market
+
+The deployment trades exactly one instrument:
 
 ```text
-target_position_fraction = signed target notional / allocated_equity
+trading_instrument_id = exchange-specific linear BTC perpetual
 ```
+
+Required properties:
+
+- linear settlement;
+- BTC underlying;
+- perpetual maturity;
+- long and short support;
+- isolated margin support;
+- one-way position mode support;
+- reduce-only support;
+- observable mark price, index price and liquidation price;
+- known contract multiplier, quantity step, minimum quantity and price tick;
+- reproducible fees and funding;
+- live position and order reconciliation.
+
+Inverse contracts are excluded because position notional, PnL and risk units differ materially from the linear contract conventions used by Production V1.
+
+### 4.2 Reference spot market
+
+The configured BTC spot market may supply:
+
+- spot OHLCV;
+- spot/perpetual basis;
+- market-quality diagnostics;
+- benchmark returns.
+
+It is never an execution target. Loss of the required spot reference feed causes feature failure when a required feature depends on it; the system does not silently switch to another spot venue.
+
+### 4.3 No runtime instrument selection
+
+Production V1 does not choose between spot and perpetual at runtime or retraining time. The BTC perpetual is fixed by architecture. Changing exchange or perpetual contract creates a new deployment candidate and requires full replay, shadow, paper and canary validation.
+
+## 5. Capital and units
+
+### 5.1 Allocated equity
+
+`allocated_equity` is the settlement-currency capital assigned to this deployment. It is not inferred from exchange account equity and may be smaller than total account equity.
+
+### 5.2 Position fraction
 
 ```text
-SPOT:       0.00 to +1.00
-PERPETUAL: -1.00 to +1.00
+target_position_fraction = signed BTC-perpetual notional / allocated_equity
 ```
 
-Spot borrowing, spot shorting, options execution, and leverage above 1.0 are excluded.
-
-### 4.2 Strategy contribution weight
-
-A contribution weight is a non-negative attribution and allocation fraction. It is not a position or quantity.
+Examples:
 
 ```text
-trend_weight + momentum_weight + mean_reversion_weight + cash_weight = 1
++0.40 = long BTC-perpetual notional equal to 40% of allocated equity
+-0.40 = short BTC-perpetual notional equal to 40% of allocated equity
+ 0.00 = flat
 ```
 
-### 4.3 Position and order ownership
+Production V1 bounds:
 
-Module 2 proposes a position fraction. Module 3 approves a position fraction and notional. Execution converts notional to exchange quantity.
+```text
+-1.00 <= target_position_fraction <= +1.00
+```
 
-## 5. Instrument selection
+The exchange may permit higher leverage, but the Risk Engine must never approve absolute notional greater than allocated equity.
 
-### 5.1 Candidate universe
+### 5.3 Small-account capability
 
-Each asset has a versioned candidate universe, normally one spot and one perpetual instrument. Every candidate must have historical simulation, live execution, and reconciliation support.
+The selected perpetual must support complete risk implementation for a small account. At deployment validation time:
 
-### 5.2 Eligibility
+```text
+minimum_order_notional / allocated_equity <= 0.01
+quantity_step_notional / allocated_equity <= 0.01
+```
 
-A candidate is rejected when:
+For capital equivalent to €1,000, both values must therefore be no greater than the settlement-currency equivalent of €10. If either ratio exceeds 1%, the instrument is ineligible for that allocation.
 
-- decision-grid coverage is below 99.5%;
-- a source gap exceeds 180 minutes;
-- fees, spread, slippage, or funding cannot be modelled;
-- instrument multiplier, minimum quantity, step, tick, margin mode, or position semantics are unknown;
-- required execution and reconciliation behaviour is unsupported;
-- median daily quote volume is below the configured threshold;
-- historical replay and live execution cannot use equivalent rules.
+### 5.4 Loss-budget sizing
 
-### 5.3 Fair comparison
+For the selected exit profile:
 
-Eligible spot and perpetual candidates use identical:
+```text
+stop_fraction = stop_distance / entry_reference_price
+risk_position_cap = risk_per_trade_fraction / max(stop_fraction, epsilon)
+```
 
-- target asset;
-- feature definitions;
-- HMM configuration;
-- expert definitions;
-- allocator formulas;
-- decision timestamps;
-- allocated equity;
-- absolute exposure cap;
-- outer folds;
-- risk limits.
-
-Costs and instrument constraints remain instrument-specific. Spot is long-or-flat; perpetual is long, flat, or short.
-
-### 5.4 Ranking
-
-Candidates must first pass every hard gate. They are then ranked by:
-
-1. higher median outer-fold net Calmar;
-2. lower median absolute 95% CVaR loss;
-3. higher median annualised net return;
-4. lower median annualised turnover;
-5. lower operational complexity.
-
-Perpetual is selected only when the paired block-bootstrap 95% interval for `perpetual Calmar - spot Calmar` has a positive lower bound and the median Calmar improvement is at least `0.10`. Otherwise eligible spot is preferred.
-
-The selected instrument is frozen. An instrument change is a new challenger deployment requiring replay, shadow, paper, canary, and manual promotion.
+The approved absolute position fraction cannot exceed `risk_position_cap`, the allocator target, the configured exposure cap or the margin cap.
 
 ## 6. Data and timing
 
 ### 6.1 Production data
 
-Production V1 uses:
+Production V1 uses only same-asset BTC data from:
 
-- spot OHLCV;
-- perpetual OHLCV;
-- funding and freshness;
-- open interest and freshness;
-- perpetual trade flow.
+```text
+gold.market.history_full.m1
+```
 
-Option trade flow is not a core dependency.
+Core source families:
 
-No trade execution, volume, or count is forward-filled. Last-known state values require valid age metadata.
+- BTC spot OHLCV;
+- BTC perpetual OHLCV;
+- BTC perpetual funding and freshness;
+- BTC perpetual open interest and freshness;
+- BTC perpetual trade flow.
+
+Option trade flow is not a Production V1 dependency.
+
+Trade executions, volume and trade counts are never forward-filled. Last-known state values may be used only with explicit observation age and availability fields.
 
 ### 6.2 Decision timing
 
-`as_of` is the close time of the latest included M1 bucket.
+`as_of` is the close time of the latest M1 bucket included in a feature snapshot.
 
 ```text
-latest included close <= as_of
+latest included source close <= as_of
 feature completion > as_of
 decision persistence >= feature completion
-earliest execution > decision persistence
+earliest execution submission > decision persistence
 ```
 
-Historical fills use the first M1 open strictly after `as_of`. If stop and take profit are both touched in one M1 bar, stop is assumed first. Gap stops fill at the first tradable simulated price plus adverse slippage.
+Historical entries use the first complete M1 bucket whose open time is strictly after `as_of`. If stop and take profit are both touched in one M1 bucket and the intrabar path is unknown, the adverse stop event is assumed first.
 
 ### 6.3 Horizons
 
@@ -183,11 +211,13 @@ primary_evaluation_horizon = 4 hours
 stress_horizon = 1 day
 ```
 
-The 4-hour horizon controls selection. The 1-day horizon controls stress diagnostics and embargo length.
+The 4-hour horizon drives model and allocator evaluation. The 1-day horizon drives stress diagnostics and the validation embargo.
 
-## 7. Feature service
+## 7. Point-in-time feature service
 
-### 7.1 Fixed regime vector
+### 7.1 Fixed HMM feature vector
+
+Production V1 uses exactly:
 
 ```text
 return_24h
@@ -197,129 +227,148 @@ open_interest_change_24h
 buy_volume_share_4h
 ```
 
-`atr_24h` is additionally computed for exit levels but is not an HMM emission feature.
+`atr_24h` and spot/perpetual basis diagnostics are computed for exits and monitoring but are not HMM emission features.
 
-A missing, stale, non-finite, or incomplete required value sets data quality to `FAIL`. Production V1 has no degraded feature mode and no silent fallback.
+A missing, stale, non-finite or incomplete required feature sets `data_quality_status = FAIL`. There is no degraded feature vector and no silent imputation.
 
 ### 7.2 Scaling
 
 ```text
-scaled = (value - training_median) / max(training_IQR, scaler_epsilon)
+scaled_value =
+    (value - training_median)
+    / max(training_IQR, scaler_epsilon)
 ```
 
-Scaler values, feature order, and definitions are frozen in the model artifact. Live inference cannot refit them.
+Feature order, formulas, medians, interquartile ranges and epsilon are frozen in the model artifact. Live inference never refits the scaler.
 
 ### 7.3 Feature evolution
 
-Production V1 does not run binary Optuna selection over more than 100 features. A new feature enters only through a controlled ablation against the frozen five-feature baseline and creates a new contract version.
+Production V1 does not perform binary feature search over more than 100 variables. A new feature enters only through controlled ablation against the frozen five-feature baseline and requires a new feature-contract version and complete outer-fold reruns.
 
 ## 8. Module 1 — Regime Estimator
 
 ### 8.1 Model
 
 ```text
-Gaussian HMM
-diagonal covariance
-3 states
-20 deterministic initialisations
-minimum 16 stable converged fits
+model_family = Gaussian HMM
+covariance_type = diagonal
+n_states = 3
+n_initialisations = 20
+minimum_stable_converged_fits = 16
 ```
 
-Full-covariance and duration-aware HMMs are challengers. Other model families are diagnostics only.
+Full-covariance and duration-aware HMMs are challengers. Other model families are research diagnostics.
 
 ### 8.2 Fit stability
 
-States are aligned across successful seeds. A fit is rejected when seed-level aligned signatures exceed the configured stability threshold. The selected seed is the highest-likelihood member of the stable, non-degenerate seed cluster.
+For every training fold:
+
+1. fit exactly 20 recorded deterministic seeds;
+2. reject non-converged and degenerate fits;
+3. align successful states by normalized state signatures;
+4. reject the model when seed-level signature distance exceeds the configured threshold;
+5. select the highest-likelihood member of the stable seed cluster.
 
 ### 8.3 Runtime output
 
-Only filtered probabilities are emitted:
+Only filtered probabilities are valid:
 
 ```text
-P(state at as_of | observations through as_of)
+P(state at as_of | observations available through as_of)
 ```
 
 ```text
 forward_probabilities_4h = current_probabilities × transition_matrix^4
-normalised_entropy = -sum(p_i * ln(p_i)) / ln(3)
+normalised_entropy = -sum(p_i × ln(p_i)) / ln(3)
 maximum_probability = max(p_i)
 ```
 
-Ambiguous fields such as generic model confidence or transition risk are excluded.
+Generic fields such as undocumented `model_confidence` or `transition_risk` are prohibited.
 
 ### 8.4 Abstention
 
-Module 1 abstains on:
+Module 1 recommends abstention on:
 
-- failed feature quality;
+- feature failure;
 - inference error;
 - invalid probability vector;
 - entropy above the configured limit;
 - maximum probability below the configured minimum;
 - invalid state alignment;
-- hash or artifact mismatch.
+- feature, scaler or artifact hash mismatch.
 
-### 8.5 State alignment
+### 8.5 State identity
 
-A new state may receive an existing signature identity only when distance is no greater than `maximum_state_alignment_distance`. Otherwise the challenger is `ALIGNMENT_INVALID` and cannot be promoted.
+A new state receives an existing signature identity only when its normalized distance is no greater than `maximum_state_alignment_distance`. Otherwise the challenger is `ALIGNMENT_INVALID` and cannot be promoted.
 
-## 9. Strategy experts
+## 9. Deterministic strategy experts
 
-Experts are deterministic and do not consume regime probabilities.
+Experts operate only on BTC data and do not consume regime probabilities.
 
-| Expert | Horizon | Role |
+| Expert | Horizon | Economic role |
 |---|---:|---|
-| Mean reversion | 1–4 hours | short reversal |
-| Momentum | 4–24 hours | continuation |
+| Mean reversion | 1–4 hours | short-horizon reversal |
+| Momentum | 4–24 hours | medium-horizon continuation |
 | Trend | 1–7 days | persistent direction |
 
-Each emits direction, strength, confidence, holding time, estimated cost, and data-quality status. Exact formulas are normative in `METHODOLOGY.md`.
+Each expert emits:
 
-Every expert is evaluated standalone after instrument-specific costs. An expert with no defensible standalone behaviour is not enabled in the combined allocator.
+```text
+direction ∈ {-1, 0, +1}
+strength ∈ [0, 1]
+confidence ∈ [0, 1]
+expected_holding_minutes
+estimated_round_trip_cost_bps
+data_quality_status
+```
+
+Every expert must show defensible standalone BTC-perpetual behaviour after costs. An expert that fails standalone gates is disabled rather than rescued by the allocator.
 
 ## 10. Module 2 — Deterministic Allocator
 
 ### 10.1 Affinity matrix
 
-The versioned matrix `affinity[state][strategy]` is estimated from inner training data using probability-weighted net return divided by probability-weighted downside deviation. Values are non-negative and each row sum is no greater than `1 - minimum_cash_fraction`.
+The versioned matrix `affinity[state][strategy]` is estimated on inner training data from probability-weighted BTC-perpetual strategy returns divided by probability-weighted downside deviation.
+
+All affinities are non-negative. Each state row sums to no more than `1 - minimum_cash_fraction`.
 
 ### 10.2 Runtime scores
 
 ```text
-regime_affinity_s = sum(probability_r * affinity[r][s])
-expert_score_s = regime_affinity_s * strength_s * confidence_s
-signed_score_s = expert_score_s * direction_s
+regime_affinity_s = sum(probability_r × affinity[r][s])
+expert_score_s = regime_affinity_s × strength_s × confidence_s
+signed_score_s = expert_score_s × direction_s
 ```
 
-Positive and negative evidence determine one consensus direction. If evidence is too weak or opposing evidence lacks configured dominance, the result is `FLAT`. Spot converts `SHORT` to `FLAT`.
+Positive and negative evidence determine one consensus direction. If evidence is too weak or insufficiently dominant, the result is `FLAT`.
 
-### 10.3 Contributions and cash
+### 10.3 Contribution weights and cash
 
-Only strategies agreeing with the consensus retain their expert score:
+Only experts agreeing with the consensus retain their score:
 
 ```text
-strategy_contribution_weight_s = active expert score_s
-cash_weight = 1 - sum(active expert scores)
+strategy_contribution_weight_s = active_expert_score_s
+cash_weight = 1 - sum(active_expert_scores)
 ```
 
-Active scores are not renormalised upward. Unused allocation remains cash. When direction is `FLAT`, all strategy contributions are zero and cash is one.
+Active scores are not renormalized upward. Unused allocation remains cash.
 
-### 10.4 Target fraction
+### 10.4 Preliminary target
 
 ```text
 regime_certainty = clamp((maximum_probability - 1/3) / (2/3), 0, 1)
 volatility_multiplier = clamp(target_volatility / max(realized_volatility_24h, floor), 0, 1)
-global_risk_multiplier = regime_certainty * volatility_multiplier
-proposed_target_fraction = direction_sign * (1 - cash_weight) * global_risk_multiplier
+global_risk_multiplier = regime_certainty × volatility_multiplier
+preliminary_target_fraction = direction_sign × (1 - cash_weight) × global_risk_multiplier
 ```
 
-Instrument bounds are then applied.
+Module 2 does not apply exchange quantities, margin or liquidation logic.
 
 ### 10.5 One net exit profile
 
-The strategy with the largest contribution is dominant:
+The expert with the largest contribution determines the provisional net exit profile:
 
-| Dominant strategy | Stop | Take profit | Time stop |
+| Dominant expert | Stop | Take profit | Time stop |
 |---|---:|---:|---:|
 | Mean reversion | 1.0 × ATR_24h | 1.5 × ATR_24h | 4 hours |
 | Momentum | 1.5 × ATR_24h | 2.5 × ATR_24h | 24 hours |
@@ -327,41 +376,43 @@ The strategy with the largest contribution is dominant:
 
 There are no sleeve-level exchange positions or opposing sleeve stops.
 
-A supervised allocator is a later challenger. Bandits and RL remain research-only.
-
 ## 11. Module 3 — Deterministic Risk Engine
 
-Module 3 outputs `APPROVED`, `CLIPPED`, `REJECTED`, or `HALTED` and an `ApprovedTargetPosition.v1`.
+Module 3 returns `APPROVED`, `CLIPPED`, `REJECTED` or `HALTED` and an `ApprovedTargetPosition.v1`.
 
 It enforces:
 
-- symbol, instrument, deployment, and artifact equality;
-- capital and loss budgets;
-- spot/perpetual exposure bounds;
-- leverage no greater than 1.0;
-- margin and liquidation buffer;
-- daily, rolling, and drawdown limits;
+- BTC symbol and exact perpetual instrument equality;
+- linear contract semantics;
+- isolated margin and one-way position mode;
+- absolute position fraction no greater than 1.0;
+- stop-distance-based risk-per-trade cap;
+- allocated-equity, loss-budget and margin-budget limits;
+- minimum liquidation buffer;
+- funding, fee, spread, slippage and round-trip cost limits;
+- daily loss, rolling loss and maximum drawdown limits;
 - maximum target change and turnover;
-- expected cost limits;
-- freshness, entropy, and abstention;
-- reconciliation and operational state;
-- kill switch.
+- data freshness, entropy and abstention;
+- reconciliation, pending-plan and kill-switch state.
 
-Abstention cannot increase absolute exposure. Module 3 never emits order type, quantity, side, or limit price.
+Abstention or uncertainty may preserve or reduce exposure but may never increase absolute exposure.
+
+Module 3 never emits order side, quantity, order type, price or child-order instructions.
 
 ## 12. External execution
 
-Execution owns:
+Execution converts the approved BTC-perpetual target notional into exchange-valid orders. It owns:
 
-- target-to-order delta;
-- exchange quantity and price rounding;
-- order type and urgency;
-- slicing;
-- maker/taker choice;
+- current-position-to-target delta;
+- contract quantity calculation;
+- quantity and price rounding;
+- order side, type and urgency;
+- maker/taker choice and slicing;
 - partial fills;
 - cancel/replace and retry;
-- stop/take-profit activation after reconciled entry fill;
-- exchange position and cash reconciliation.
+- reduce-only protective orders;
+- mark, index and liquidation-price monitoring;
+- position, margin, cash and open-order reconciliation.
 
 Every approval creates at most one logical execution plan through deterministic idempotency.
 
@@ -370,47 +421,63 @@ Every approval creates at most one logical execution plan through deterministic 
 ### 13.1 Default schedule
 
 ```text
-outer training = previous 3 years
-outer test = next 3 months
+outer training window = previous 3 years
+outer test interval = next 3 months
 outer step = 3 months
-inner validation = 3 months
-retraining = quarterly
+inner validation block = 3 months
+retraining frequency = quarterly
+purge = longest overlapping target interval
 embargo = 1 day
 ```
 
 ### 13.2 Fold procedure
 
-For each eligible instrument and outer fold:
+For every outer fold:
 
-1. build training-only point-in-time features;
-2. fit the training-only scaler;
-3. fit 20 HMM seeds;
-4. reject unstable fits;
-5. generate filtered out-of-fold probabilities;
-6. generate expert returns after instrument-specific costs;
+1. validate BTC perpetual and BTC spot source coverage;
+2. build point-in-time features from training data only;
+3. fit the robust scaler on each inner training fold only;
+4. fit and stability-check 20 HMM seeds;
+5. generate filtered out-of-fold regime probabilities;
+6. generate standalone BTC-perpetual expert returns after full costs;
 7. estimate the affinity matrix on inner training data;
-8. validate the deterministic pipeline;
+8. simulate the deterministic pipeline with margin, funding, stops and costs;
 9. freeze the candidate;
-10. evaluate once on the outer test.
+10. evaluate it once on the untouched outer test interval.
 
-### 13.3 Hard gates
+### 13.3 Required benchmarks
+
+The Production V1 pipeline is compared against:
+
+- cash;
+- BTC spot buy-and-hold as an information benchmark;
+- unlevered BTC-perpetual long-only buy-and-hold;
+- each standalone expert;
+- an equal-weight deterministic expert mix without regime context;
+- the same experts with static, non-regime weights.
+
+Spot benchmark performance never makes spot tradable.
+
+### 13.4 Hard gates
 
 Reject a candidate on:
 
 - leakage or timing violation;
-- instrument ineligibility;
-- fewer than 16 stable converged seeds;
+- BTC perpetual instrument-contract failure;
+- small-account capability failure;
+- fewer than 16 stable converged HMM seeds;
 - state occupancy below 5%;
-- median duration below 2 hours;
+- median state duration below 2 hours;
 - invalid state alignment;
 - non-positive net return in more than 40% of outer folds;
-- one fold above 50% of aggregate positive PnL;
-- drawdown limit breach;
-- failed elevated or severe cost stress;
+- one fold contributing more than 50% of aggregate positive PnL;
+- research drawdown-limit breach;
+- minimum liquidation-buffer breach;
+- elevated or severe cost-stress failure;
 - historical/live feature mismatch;
-- unsupported operational behaviour.
+- unsupported execution or reconciliation behaviour.
 
-Primary selection metric is net Calmar. CVaR, Sharpe, Sortino, turnover, fold consistency, state stability, and abstention are secondary diagnostics. Exact definitions are in `METHODOLOGY.md`.
+Primary model-selection metric is net Calmar. CVaR, Sharpe, Sortino, turnover, fold consistency, state stability, funding sensitivity, liquidation distance and abstention are mandatory secondary diagnostics.
 
 ## 14. Production lifecycle
 
@@ -419,27 +486,30 @@ offline research
 → historical replay
 → live feature shadow
 → full decision shadow
-→ paper execution
-→ small-capital canary
+→ paper BTC-perpetual execution
+→ small-capital BTC-perpetual canary
 → restricted production
 ```
 
-Promotion is manual. The instrument, model, scaler, affinity matrix, strategy configuration, risk configuration, timing policy, cost model, code, and dependencies are promoted and rolled back as one compatible set.
+Promotion is manual. The BTC perpetual specification, reference spot specification, model, scaler, affinity matrix, strategy configuration, risk configuration, operations configuration, timing policy, cost model, code and dependencies are promoted and rolled back as one compatible artifact set.
 
 ## 15. Production readiness
 
-Production requires:
+Production activation requires:
 
 - executable contract validation;
 - one shared historical/live decision function;
-- exact feature parity;
-- robust instrument selection;
+- exact historical/live feature parity;
+- validated linear BTC-perpetual contract semantics;
+- verified isolated margin and one-way position mode;
+- verified 1% small-account sizing granularity;
 - stable multi-seed HMM results;
-- standalone expert evidence;
-- deterministic allocator improvement over cash and static baselines;
-- complete cost stress;
-- risk-engine property, stress, replay, idempotency, and fail-closed tests;
-- paper cost calibration;
-- successful canary operation;
+- standalone expert evidence after costs;
+- deterministic allocator improvement over required baselines;
+- complete funding and cost stress;
+- liquidation-buffer stress tests;
+- risk-engine property, replay, idempotency and fail-closed tests;
+- paper execution cost calibration;
+- successful small-capital canary operation;
 - immutable audit records;
 - tested manual rollback.
