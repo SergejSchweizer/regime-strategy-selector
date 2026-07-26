@@ -8,53 +8,51 @@
 target_symbol ∈ {BTC, ETH, SOL}
 ```
 
-A deployment is also bound to exactly one traded instrument selected from an explicit asset-specific universe:
+A deployment is bound to exactly one traded instrument:
 
 ```text
 selected_instrument_type ∈ {SPOT, PERPETUAL}
 ```
 
-The same-asset spot and perpetual markets may both supply features, but only the selected instrument may receive orders.
+Same-asset spot and perpetual data may both be used as information, but only the selected instrument may be traded.
 
-The system does not allocate capital across BTC, ETH, and SOL. If separate deployments share an exchange account, an external account-level capital service must assign each deployment an immutable `allocated_equity` and `max_loss_budget`.
+The system does not allocate account capital across BTC, ETH, and SOL. An external capital service assigns each deployment an immutable `allocated_equity`, `max_loss_budget`, and `max_margin_budget`.
 
-## 2. Normative Production V1
+Exact schemas are in [`CONTRACTS.md`](CONTRACTS.md), formulas in [`METHODOLOGY.md`](METHODOLOGY.md), and runtime rules in [`OPERATIONS.md`](OPERATIONS.md).
 
-Production V1 intentionally restricts model and execution freedom.
+## 2. Production V1 scope
 
 | Concern | Production V1 rule |
 |---|---|
-| Asset scope | exactly one of BTC, ETH, SOL |
+| Asset | exactly one of BTC, ETH, SOL |
 | Decision interval | 1 hour |
-| Primary evaluation horizon | 4 hours |
+| Primary horizon | 4 hours |
 | Stress horizon | 1 day |
-| Regime count | 3 |
-| Regime model | Gaussian HMM, diagonal covariance |
-| Core regime features | fixed five-feature set |
+| Regime model | Gaussian HMM, diagonal covariance, 3 states |
+| Regime features | fixed five-feature vector |
+| Strategy experts | deterministic trend, momentum, mean reversion |
 | Allocator | deterministic probability-weighted mapping |
-| Position structure | one net direction and one net position |
-| Exit structure | one net stop, one net take-profit, one time stop |
-| Instrument universe | eligible spot and perpetual candidates |
-| Perpetual leverage | absolute target position fraction no greater than 1.0 |
-| Promotion | manual only |
-| RL and bandits | research only |
+| Position | one signed net position |
+| Exit | one stop, one take profit, one time stop |
+| Instruments | eligible spot and perpetual candidates |
+| Leverage | absolute position fraction no greater than 1.0 |
+| Promotion | manual and atomic |
+| Bandits/RL | research only |
 
-Production V1 has only one learned runtime component: the Regime Estimator. The allocator and risk engine are deterministic and versioned.
+Production V1 has one learned runtime component: Module 1. Module 2 and Module 3 are deterministic.
 
 ## 3. System boundary
 
 ```text
 gold.market.history_full.m1
-            │
-            ├── filter symbol == target_symbol
-            ├── validate source freshness and coverage
+            │ filter symbol == target_symbol
             ▼
  point-in-time feature service
             │
-            ├────────────► training targets (offline only)
-            ├────────────► trend expert
-            ├────────────► momentum expert
-            └────────────► mean-reversion expert
+            ├── training targets, offline only
+            ├── trend expert
+            ├── momentum expert
+            └── mean-reversion expert
             ▼
  Module 1: Regime Estimator
             │ RegimePrediction.v1
@@ -66,193 +64,130 @@ gold.market.history_full.m1
             │ ApprovedTargetPosition.v1
             ▼
  external execution system
-            │
             ▼
- exchange orders, fills, cancels, reconciliation
+ orders, fills, cancels, reconciliation
 ```
 
-The analytical repository stops at `ApprovedTargetPosition.v1`. It does not choose order type, limit price, child-order schedule, maker/taker behaviour, retry policy, or cancel/replace behaviour.
+The analytical repository stops at `ApprovedTargetPosition.v1`. Order type, price, quantity, slicing, maker/taker behaviour, retries, and cancel/replace belong only to execution.
 
-## 4. Unambiguous units
+## 4. Units
 
-### 4.1 Allocated equity
-
-`allocated_equity` is the capital assigned to this deployment by an external account-level service.
-
-### 4.2 Target position fraction
+### 4.1 Target position fraction
 
 ```text
 target_position_fraction = signed target notional / allocated_equity
 ```
 
-Examples:
-
 ```text
-+0.40 = long notional equal to 40% of allocated equity
--0.40 = short notional equal to 40% of allocated equity
- 0.00 = flat
+SPOT:       0.00 to +1.00
+PERPETUAL: -1.00 to +1.00
 ```
 
-Production V1 bounds are:
+Spot borrowing, spot shorting, options execution, and leverage above 1.0 are excluded.
+
+### 4.2 Strategy contribution weight
+
+A contribution weight is a non-negative attribution and allocation fraction. It is not a position or quantity.
 
 ```text
-SPOT:       0.00 <= target_position_fraction <= 1.00
-PERPETUAL: -1.00 <= target_position_fraction <= 1.00
+trend_weight + momentum_weight + mean_reversion_weight + cash_weight = 1
 ```
 
-Spot shorting, borrowing, options execution, and leverage above 1.0 are excluded from Production V1.
+### 4.3 Position and order ownership
 
-### 4.3 Risk budget
-
-A strategy contribution weight is a non-negative attribution weight. It is not a position and not a quantity. Trend, momentum, mean-reversion, and cash weights sum to one.
-
-### 4.4 Price and quantity
-
-The analytical system uses decimal prices and base-asset quantities only for observation and approved target calculation. The execution system converts approved notional into exchange-valid quantity using instrument multiplier, quantity step, price tick, and current reference price.
+Module 2 proposes a position fraction. Module 3 approves a position fraction and notional. Execution converts notional to exchange quantity.
 
 ## 5. Instrument selection
 
 ### 5.1 Candidate universe
 
-Every asset has an explicit, versioned `InstrumentUniverse.v1`. A normal universe contains:
+Each asset has a versioned candidate universe, normally one spot and one perpetual instrument. Every candidate must have historical simulation, live execution, and reconciliation support.
 
-```text
-one spot instrument
-one perpetual instrument
-```
+### 5.2 Eligibility
 
-The universe may contain only instruments supported by the execution system and the historical simulator.
+A candidate is rejected when:
 
-### 5.2 Eligibility gates
-
-An instrument is ineligible when any of the following is true:
-
-- historical decision-grid coverage is below 99.5% in an outer training window;
-- a contiguous market-data gap exceeds three decision intervals;
-- the cost model cannot represent fees, spread, slippage, and, for perpetuals, funding;
-- exchange minimum size, tick, quantity step, margin mode, or position semantics are unknown;
-- live reconciliation is not implemented;
-- required order types or reduce-only behaviour are unsupported;
-- the instrument breaches configured liquidity or notional-capacity limits;
-- the instrument cannot be reproduced identically in historical replay and live execution.
-
-Coverage thresholds are defaults and must be versioned. They cannot be relaxed after inspecting an outer test result.
+- decision-grid coverage is below 99.5%;
+- a source gap exceeds 180 minutes;
+- fees, spread, slippage, or funding cannot be modelled;
+- instrument multiplier, minimum quantity, step, tick, margin mode, or position semantics are unknown;
+- required execution and reconciliation behaviour is unsupported;
+- median daily quote volume is below the configured threshold;
+- historical replay and live execution cannot use equivalent rules.
 
 ### 5.3 Fair comparison
 
-Spot and perpetual candidates are evaluated with:
+Eligible spot and perpetual candidates use identical:
 
-- the same target asset;
-- the same feature service;
-- the same regime model family and parameters;
-- the same expert definitions;
-- the same allocator formula;
-- the same decision timestamps;
-- the same allocated equity;
-- the same absolute exposure cap of 1.0;
-- instrument-specific but complete costs and execution constraints;
-- the same outer walk-forward periods.
+- target asset;
+- feature definitions;
+- HMM configuration;
+- expert definitions;
+- allocator formulas;
+- decision timestamps;
+- allocated equity;
+- absolute exposure cap;
+- outer folds;
+- risk limits.
 
-Spot is long-or-flat. Perpetual is long, flat, or short. This constraint is part of the comparison and must not be normalised away.
+Costs and instrument constraints remain instrument-specific. Spot is long-or-flat; perpetual is long, flat, or short.
 
-### 5.4 Ranking rule
+### 5.4 Ranking
 
-An eligible instrument must first pass all risk and robustness gates. Remaining candidates are ranked lexicographically:
+Candidates must first pass every hard gate. They are then ranked by:
 
-1. highest median outer-fold net Calmar ratio;
+1. higher median outer-fold net Calmar;
 2. lower median absolute 95% CVaR loss;
 3. higher median annualised net return;
 4. lower median annualised turnover;
 5. lower operational complexity.
 
-`net` means after fees, spread, slippage, and funding.
+Perpetual is selected only when the paired block-bootstrap 95% interval for `perpetual Calmar - spot Calmar` has a positive lower bound and the median Calmar improvement is at least `0.10`. Otherwise eligible spot is preferred.
 
-A paired block-bootstrap comparison is computed for the difference in outer-fold Calmar results. The perpetual is selected only when:
-
-```text
-lower bound of the 95% confidence interval > 0
-and
-median Calmar improvement >= min_calmar_improvement
-```
-
-The default `min_calmar_improvement` is `0.10`. If these conditions are not met, spot is selected when it passes all gates. Therefore a clearly superior perpetual is traded, while statistically indistinguishable results resolve to the simpler spot instrument.
-
-### 5.5 Selection lifecycle
-
-Instrument selection is never performed at every trading decision. It is performed during model-development and challenger evaluation. The selected instrument is frozen in the compatible artifact set.
-
-Changing from spot to perpetual or from perpetual to spot creates a new deployment challenger and requires:
-
-```text
-historical replay
-→ live decision shadow
-→ paper execution
-→ small-capital canary
-→ manual promotion
-```
+The selected instrument is frozen. An instrument change is a new challenger deployment requiring replay, shadow, paper, canary, and manual promotion.
 
 ## 6. Data and timing
 
-### 6.1 Source data
+### 6.1 Production data
 
-Production V1 uses only:
-
-```text
-gold.market.history_full.m1
-```
-
-Eligible same-asset source families are:
+Production V1 uses:
 
 - spot OHLCV;
 - perpetual OHLCV;
-- funding state and age;
-- open-interest state and age;
-- perpetual trade-flow aggregates.
+- funding and freshness;
+- open interest and freshness;
+- perpetual trade flow.
 
-Option trade flow is excluded from the Production V1 core feature set. It may be evaluated later as an optional challenger block only when asset-specific coverage passes the same data gates.
+Option trade flow is not a core dependency.
 
-Trade executions, volume, and trade counts are never forward-filled. Last-known funding and open-interest values may be used only with their age and availability fields.
+No trade execution, volume, or count is forward-filled. Last-known state values require valid age metadata.
 
-### 6.2 Decision timestamp
+### 6.2 Decision timing
 
-`as_of` is the close time of the latest M1 bucket included in the feature snapshot.
-
-Rules:
+`as_of` is the close time of the latest included M1 bucket.
 
 ```text
-all included source buckets have close_time <= as_of
-feature computation starts after as_of
-analytical decision is persisted before execution begins
-earliest live order submission > as_of
+latest included close <= as_of
+feature completion > as_of
+decision persistence >= feature completion
+earliest execution > decision persistence
 ```
 
-### 6.3 Historical fill rule
+Historical fills use the first M1 open strictly after `as_of`. If stop and take profit are both touched in one M1 bar, stop is assumed first. Gap stops fill at the first tradable simulated price plus adverse slippage.
 
-A historical decision cannot fill in a bucket used to construct that decision.
+### 6.3 Horizons
 
 ```text
-historical entry bucket = first complete M1 bucket with open_time > as_of
+decision_interval = 1 hour
+primary_evaluation_horizon = 4 hours
+stress_horizon = 1 day
 ```
 
-The simulated fill starts from that bucket's open price and applies the configured spread, slippage, fee, and funding model.
+The 4-hour horizon controls selection. The 1-day horizon controls stress diagnostics and embargo length.
 
-When both stop and take-profit are touched inside the same M1 bucket and the intra-bucket path is unknown, the adverse event is assumed to occur first. A gap through a stop fills at the first tradable simulated price plus adverse slippage.
+## 7. Feature service
 
-### 6.4 Horizons
-
-```text
-decision_interval = 1h
-primary_evaluation_horizon = 4h
-stress_horizon = 1d
-```
-
-The 4-hour horizon drives model and allocator selection. The 1-day horizon is a risk diagnostic and embargo requirement. It is not a second optimisation objective of equal priority.
-
-## 7. Point-in-time feature service
-
-### 7.1 Fixed Production V1 feature vector
-
-The Regime Estimator consumes exactly five features:
+### 7.1 Fixed regime vector
 
 ```text
 return_24h
@@ -262,365 +197,220 @@ open_interest_change_24h
 buy_volume_share_4h
 ```
 
-Definitions are in `CONTRACTS.md` and executable feature code must match the feature-set hash.
+`atr_24h` is additionally computed for exit levels but is not an HMM emission feature.
 
-No silent fallback is allowed. If a required core feature is unavailable or stale beyond its contract limit, `MarketFeatureFrame.v1.data_quality_status = FAIL` and the system may only preserve or reduce exposure.
+A missing, stale, non-finite, or incomplete required value sets data quality to `FAIL`. Production V1 has no degraded feature mode and no silent fallback.
 
 ### 7.2 Scaling
 
-Production V1 uses a training-only robust scaler:
-
 ```text
-scaled_value = (value - training_median) / max(training_IQR, scaler_epsilon)
+scaled = (value - training_median) / max(training_IQR, scaler_epsilon)
 ```
 
-The median, interquartile range, epsilon, column order, and feature definitions are stored in the model artifact. Live inference may not refit or update the scaler.
+Scaler values, feature order, and definitions are frozen in the model artifact. Live inference cannot refit them.
 
 ### 7.3 Feature evolution
 
-New features are introduced by controlled ablation:
-
-1. register one feature or one coherent feature block;
-2. rerun all outer folds;
-3. compare against the frozen five-feature baseline;
-4. require stable incremental value after costs;
-5. create a new feature-contract version.
-
-Blind binary search across more than 100 features is excluded from Production V1.
+Production V1 does not run binary Optuna selection over more than 100 features. A new feature enters only through a controlled ablation against the frozen five-feature baseline and creates a new contract version.
 
 ## 8. Module 1 — Regime Estimator
 
-### 8.1 Production model
+### 8.1 Model
 
 ```text
-model_family = Gaussian HMM
-covariance_type = diagonal
-n_states = 3
-n_initialisations = 20
+Gaussian HMM
+diagonal covariance
+3 states
+20 deterministic initialisations
+minimum 16 stable converged fits
 ```
 
-Model challengers are full-covariance Gaussian HMM and a duration-aware HMM. GMM, generic change-point models, contextual bandits, and RL are research diagnostics, not Production V1 candidates.
+Full-covariance and duration-aware HMMs are challengers. Other model families are diagnostics only.
 
-### 8.2 Fitting requirements
+### 8.2 Fit stability
 
-For each fit:
+States are aligned across successful seeds. A fit is rejected when seed-level aligned signatures exceed the configured stability threshold. The selected seed is the highest-likelihood member of the stable, non-degenerate seed cluster.
 
-- run exactly 20 deterministic seeds recorded in the artifact;
-- require at least 16 converged, non-degenerate fits;
-- align states across successful seeds using state signatures;
-- reject the candidate when median aligned signature distance exceeds the configured seed-stability threshold;
-- select the highest training likelihood only from the stable, non-degenerate seed cluster.
+### 8.3 Runtime output
 
-### 8.3 Runtime probabilities
-
-Only filtered probabilities are valid:
+Only filtered probabilities are emitted:
 
 ```text
-P(state at as_of | observations with timestamp <= as_of)
+P(state at as_of | observations through as_of)
 ```
-
-The 4-hour forward vector is computed as:
 
 ```text
 forward_probabilities_4h = current_probabilities × transition_matrix^4
-```
-
-because the decision interval is one hour.
-
-Normalised entropy is:
-
-```text
 normalised_entropy = -sum(p_i * ln(p_i)) / ln(3)
+maximum_probability = max(p_i)
 ```
 
-It is in `[0, 1]`. `maximum_probability = max(p_i)`.
-
-The contract does not expose ambiguous fields named `model_confidence` or `transition_risk`.
+Ambiguous fields such as generic model confidence or transition risk are excluded.
 
 ### 8.4 Abstention
 
-Module 1 recommends abstention when any of the following is true:
+Module 1 abstains on:
 
-- feature data quality is `FAIL`;
-- inference fails;
-- probability values are invalid;
-- normalised entropy exceeds `max_regime_entropy`;
-- maximum probability is below `min_regime_probability`;
-- the deployed state alignment is invalid;
-- the feature or model artifact hash does not match.
+- failed feature quality;
+- inference error;
+- invalid probability vector;
+- entropy above the configured limit;
+- maximum probability below the configured minimum;
+- invalid state alignment;
+- hash or artifact mismatch.
 
 ### 8.5 State alignment
 
-Each state signature contains return, volatility, downside volatility, trend strength, drawdown state, funding, open-interest change, flow imbalance, duration, and occupancy.
-
-Minimum-distance matching may be used only when the matched distance is no greater than `max_state_alignment_distance`. A state above this threshold is not forcibly assigned an old business identity. The challenger is marked `ALIGNMENT_INVALID` and cannot be promoted.
+A new state may receive an existing signature identity only when distance is no greater than `maximum_state_alignment_distance`. Otherwise the challenger is `ALIGNMENT_INVALID` and cannot be promoted.
 
 ## 9. Strategy experts
 
-Experts are deterministic, independently testable signal generators. They do not receive regime probabilities.
+Experts are deterministic and do not consume regime probabilities.
 
-| Expert | Required economic horizon | Output role |
+| Expert | Horizon | Role |
 |---|---:|---|
-| Mean reversion | 1–4 hours | short-horizon reversal |
-| Momentum | 4–24 hours | medium-horizon continuation |
+| Mean reversion | 1–4 hours | short reversal |
+| Momentum | 4–24 hours | continuation |
 | Trend | 1–7 days | persistent direction |
 
-Each expert emits:
+Each emits direction, strength, confidence, holding time, estimated cost, and data-quality status. Exact formulas are normative in `METHODOLOGY.md`.
 
-```text
-direction in {-1, 0, +1}
-strength in [0, 1]
-confidence in [0, 1]
-expected_holding_minutes
-estimated_cost_bps
-data_quality_status
-```
-
-Feature overlap is allowed only when the expert contract documents why the same observation has a different horizon-specific meaning.
-
-Experts are evaluated standalone after costs. An expert that does not have defensible standalone behaviour cannot be rescued solely by the allocator.
+Every expert is evaluated standalone after instrument-specific costs. An expert with no defensible standalone behaviour is not enabled in the combined allocator.
 
 ## 10. Module 2 — Deterministic Allocator
 
-### 10.1 Regime-strategy affinity matrix
+### 10.1 Affinity matrix
 
-The allocator contains a versioned matrix:
+The versioned matrix `affinity[state][strategy]` is estimated from inner training data using probability-weighted net return divided by probability-weighted downside deviation. Values are non-negative and each row sum is no greater than `1 - minimum_cash_fraction`.
 
-```text
-affinity[state][strategy] in [0, 1]
-```
-
-Rows correspond to aligned regime signatures. Columns correspond to trend, momentum, and mean reversion.
-
-The matrix is estimated on inner training data only. For each state and strategy:
+### 10.2 Runtime scores
 
 ```text
-weighted_mean_return =
-    sum(state_probability_t * strategy_net_return_t)
-    / sum(state_probability_t)
-
-weighted_downside =
-    sqrt(
-        sum(state_probability_t * min(strategy_net_return_t, 0)^2)
-        / sum(state_probability_t)
-    )
-
-raw_affinity = max(
-    0,
-    weighted_mean_return / max(weighted_downside, affinity_epsilon)
-)
-```
-
-Each row is clipped to `[0, 1]` and normalised so its three strategy affinities sum to no more than `1 - minimum_cash_fraction`. All constants are versioned.
-
-### 10.2 Runtime strategy scores
-
-For each strategy:
-
-```text
-regime_affinity_s = sum(current_probability_r * affinity[r][s])
+regime_affinity_s = sum(probability_r * affinity[r][s])
 expert_score_s = regime_affinity_s * strength_s * confidence_s
 signed_score_s = expert_score_s * direction_s
 ```
 
-Positive and negative evidence are:
+Positive and negative evidence determine one consensus direction. If evidence is too weak or opposing evidence lacks configured dominance, the result is `FLAT`. Spot converts `SHORT` to `FLAT`.
+
+### 10.3 Contributions and cash
+
+Only strategies agreeing with the consensus retain their expert score:
 
 ```text
-positive_evidence = sum(max(signed_score_s, 0))
-negative_evidence = sum(abs(min(signed_score_s, 0)))
+strategy_contribution_weight_s = active expert score_s
+cash_weight = 1 - sum(active expert scores)
 ```
 
-Direction selection:
+Active scores are not renormalised upward. Unused allocation remains cash. When direction is `FLAT`, all strategy contributions are zero and cash is one.
+
+### 10.4 Target fraction
 
 ```text
-if max(positive_evidence, negative_evidence) < min_consensus_evidence:
-    direction = FLAT
-else if min(positive_evidence, negative_evidence) > 0
-        and max(...) / min(...) < min_direction_dominance:
-    direction = FLAT
-else:
-    direction = LONG when positive_evidence > negative_evidence
-    direction = SHORT when negative_evidence > positive_evidence
-```
-
-For a spot instrument, `SHORT` is converted to `FLAT`.
-
-Strategies opposing the consensus direction receive zero contribution. Remaining strategy scores are normalised into non-negative strategy contribution weights.
-
-### 10.3 Cash and risk multiplier
-
-The minimum cash fraction is configured and cannot be negative.
-
-Regime certainty is:
-
-```text
-regime_certainty =
-    clamp((maximum_probability - 1/3) / (2/3), 0, 1)
-```
-
-Volatility scaling is:
-
-```text
-volatility_multiplier =
-    clamp(target_volatility_annual / max(realized_volatility_24h, volatility_floor), 0, 1)
-```
-
-The global risk multiplier is:
-
-```text
+regime_certainty = clamp((maximum_probability - 1/3) / (2/3), 0, 1)
+volatility_multiplier = clamp(target_volatility / max(realized_volatility_24h, floor), 0, 1)
 global_risk_multiplier = regime_certainty * volatility_multiplier
+proposed_target_fraction = direction_sign * (1 - cash_weight) * global_risk_multiplier
 ```
 
-The preliminary signed target is:
+Instrument bounds are then applied.
 
-```text
-proposed_target_position_fraction =
-    direction_sign
-    * (1 - cash_fraction)
-    * global_risk_multiplier
-```
+### 10.5 One net exit profile
 
-where `direction_sign` is `-1`, `0`, or `+1`.
+The strategy with the largest contribution is dominant:
 
-### 10.4 One net exit profile
-
-Production V1 has one net position and one net exit profile. No sleeve-level exchange stops exist.
-
-The dominant strategy is the strategy with the largest contribution weight. It selects a deterministic profile:
-
-| Dominant strategy | Stop distance | Take-profit distance | Maximum holding time |
+| Dominant strategy | Stop | Take profit | Time stop |
 |---|---:|---:|---:|
 | Mean reversion | 1.0 × ATR_24h | 1.5 × ATR_24h | 4 hours |
 | Momentum | 1.5 × ATR_24h | 2.5 × ATR_24h | 24 hours |
 | Trend | 2.0 × ATR_24h | 4.0 × ATR_24h | 72 hours |
 
-For a long position:
+There are no sleeve-level exchange positions or opposing sleeve stops.
 
-```text
-stop = entry_reference_price - stop_distance
-take_profit = entry_reference_price + take_profit_distance
-```
-
-For a short position the signs are reversed.
-
-The entry reference price is the first reconciled average fill price supplied by the execution system. Until that fill exists, exit levels are provisional and no close-order price is assumed by the analytical system.
-
-### 10.5 Learned allocators
-
-A regularised supervised allocator may be evaluated as a challenger after Production V1 is stable. Contextual bandits and reinforcement learning remain research-only until a supervised challenger has demonstrated stable incremental value.
+A supervised allocator is a later challenger. Bandits and RL remain research-only.
 
 ## 11. Module 3 — Deterministic Risk Engine
 
-Module 3 receives the proposal, capital allocation, current portfolio, instrument constraints, operational state, and risk configuration.
+Module 3 outputs `APPROVED`, `CLIPPED`, `REJECTED`, or `HALTED` and an `ApprovedTargetPosition.v1`.
 
-It may return only:
+It enforces:
 
-```text
-APPROVED
-CLIPPED
-REJECTED
-HALTED
-```
-
-It outputs an approved target, not orders.
-
-The engine enforces:
-
-- exact target-symbol and selected-instrument equality;
-- allocated-equity and max-loss budget;
-- spot or perpetual exposure bounds;
-- perpetual leverage no greater than 1.0 in Production V1;
-- margin and liquidation-buffer rules;
-- current and projected drawdown;
-- daily and rolling loss limits;
+- symbol, instrument, deployment, and artifact equality;
+- capital and loss budgets;
+- spot/perpetual exposure bounds;
+- leverage no greater than 1.0;
+- margin and liquidation buffer;
+- daily, rolling, and drawdown limits;
 - maximum target change and turnover;
-- maximum modeled cost;
-- feature freshness and data-quality status;
-- regime entropy and abstention;
-- portfolio reconciliation;
-- pending-decision and operational state;
+- expected cost limits;
+- freshness, entropy, and abstention;
+- reconciliation and operational state;
 - kill switch.
 
-When any upstream component recommends abstention, the approved absolute exposure cannot exceed the current reconciled absolute exposure.
+Abstention cannot increase absolute exposure. Module 3 never emits order type, quantity, side, or limit price.
 
-## 12. Execution boundary
+## 12. External execution
 
-The execution system converts an approved target into orders. It owns:
+Execution owns:
 
-- target-to-order delta calculation;
-- quantity and price rounding;
-- order type;
-- slicing and urgency;
+- target-to-order delta;
+- exchange quantity and price rounding;
+- order type and urgency;
+- slicing;
 - maker/taker choice;
 - partial fills;
-- cancel/replace;
-- retry and rate-limit handling;
-- exchange acknowledgements;
-- position and cash reconciliation;
-- activation and maintenance of stop/take-profit orders.
+- cancel/replace and retry;
+- stop/take-profit activation after reconciled entry fill;
+- exchange position and cash reconciliation.
 
-The execution system must use deterministic idempotency keys and must not create more than one logical execution plan for the same approved decision.
+Every approval creates at most one logical execution plan through deterministic idempotency.
 
 ## 13. Training and validation
 
 ### 13.1 Default schedule
 
 ```text
-outer training window = previous 3 years
-outer test interval = next 3 months
+outer training = previous 3 years
+outer test = next 3 months
 outer step = 3 months
-inner validation block = 3 months
-retraining frequency = quarterly
-purge = longest overlapping target interval
+inner validation = 3 months
+retraining = quarterly
 embargo = 1 day
 ```
 
-### 13.2 Selection order
+### 13.2 Fold procedure
 
-For each instrument candidate and outer fold:
+For each eligible instrument and outer fold:
 
-1. apply instrument eligibility gates;
-2. build point-in-time features from outer training data only;
-3. fit the robust scaler on each inner training fold only;
-4. fit 20 HMM seeds;
-5. reject unstable model fits;
-6. emit filtered out-of-fold probabilities;
-7. generate standalone expert returns after instrument-specific costs;
-8. estimate the deterministic affinity matrix on inner training data;
-9. evaluate the full deterministic pipeline on inner validation data;
-10. freeze the selected configuration;
-11. evaluate once on the outer test interval.
+1. build training-only point-in-time features;
+2. fit the training-only scaler;
+3. fit 20 HMM seeds;
+4. reject unstable fits;
+5. generate filtered out-of-fold probabilities;
+6. generate expert returns after instrument-specific costs;
+7. estimate the affinity matrix on inner training data;
+8. validate the deterministic pipeline;
+9. freeze the candidate;
+10. evaluate once on the outer test.
 
-Completed outer folds are aggregated before instrument or model promotion.
+### 13.3 Hard gates
 
-### 13.3 Hard research gates
+Reject a candidate on:
 
-A candidate is rejected when:
+- leakage or timing violation;
+- instrument ineligibility;
+- fewer than 16 stable converged seeds;
+- state occupancy below 5%;
+- median duration below 2 hours;
+- invalid state alignment;
+- non-positive net return in more than 40% of outer folds;
+- one fold above 50% of aggregate positive PnL;
+- drawdown limit breach;
+- failed elevated or severe cost stress;
+- historical/live feature mismatch;
+- unsupported operational behaviour.
 
-- any leakage or timing violation exists;
-- data eligibility fails;
-- fewer than 16 of 20 HMM seeds converge stably;
-- any state occupancy is below 5%;
-- median episode duration is below 2 decision intervals;
-- state alignment exceeds the configured threshold;
-- net return is non-positive in more than 40% of outer folds;
-- one fold contributes more than 50% of aggregate positive PnL;
-- maximum drawdown exceeds the research limit;
-- elevated or severe cost stress removes all positive median return;
-- historical and live feature definitions differ;
-- the candidate requires unsupported operational behaviour.
-
-### 13.4 Primary model metric
-
-The primary performance measure is net Calmar ratio:
-
-```text
-net_Calmar = annualised_net_return / absolute_maximum_drawdown
-```
-
-If annualised net return is not positive, net Calmar is treated as non-promotable regardless of its numerical value.
-
-Secondary diagnostics are 95% CVaR, Sharpe, Sortino, turnover, profitable-fold fraction, parameter stability, state stability, and abstention quality.
+Primary selection metric is net Calmar. CVaR, Sharpe, Sortino, turnover, fold consistency, state stability, and abstention are secondary diagnostics. Exact definitions are in `METHODOLOGY.md`.
 
 ## 14. Production lifecycle
 
@@ -634,24 +424,22 @@ offline research
 → restricted production
 ```
 
-Every promotion is manual. A challenger must carry immutable data, feature, instrument, model, allocator, risk, code, and dependency identifiers.
+Promotion is manual. The instrument, model, scaler, affinity matrix, strategy configuration, risk configuration, timing policy, cost model, code, and dependencies are promoted and rolled back as one compatible set.
 
-Rollback restores the previous complete compatible artifact set. Partial rollback of only the model or only the instrument is prohibited.
+## 15. Production readiness
 
-## 15. Production-readiness criteria
+Production requires:
 
-The system is not production-ready until:
-
-- executable contracts validate every payload;
-- historical and live decisions use the same decision function;
-- the fixed five features reproduce exactly in shadow mode;
-- instrument selection passes eligibility, cost, bootstrap, and robustness gates;
-- the selected instrument remains stable across completed outer folds;
-- the HMM passes multi-seed and state-alignment tests;
-- experts have defensible standalone net behaviour;
-- deterministic allocation beats cash and static baselines;
-- risk controls pass boundary, property, stress, replay, idempotency, and fail-closed tests;
-- paper fills validate the historical cost model;
-- canary operation remains inside predefined incident and loss limits;
-- every decision is reproducible;
-- manual rollback is tested.
+- executable contract validation;
+- one shared historical/live decision function;
+- exact feature parity;
+- robust instrument selection;
+- stable multi-seed HMM results;
+- standalone expert evidence;
+- deterministic allocator improvement over cash and static baselines;
+- complete cost stress;
+- risk-engine property, stress, replay, idempotency, and fail-closed tests;
+- paper cost calibration;
+- successful canary operation;
+- immutable audit records;
+- tested manual rollback.
