@@ -44,9 +44,47 @@ The repository deliberately keeps only three detailed documentation files:
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — system design, component boundaries, persistent-state semantics, public contracts and compatibility rules.
 - [`METHODOLOGY.md`](METHODOLOGY.md) — exact formulas, backtest conventions, statistical and economic validation, exit optimisation and research work packages.
-- [`OPERATIONS.md`](OPERATIONS.md) — runtime state machines, security, monitoring, MLflow usage, Model Registry, promotion, rollback and implementation workflow.
+- [`OPERATIONS.md`](OPERATIONS.md) — runtime state machines, security, monitoring, use of the existing MLflow service, Model Registry, promotion, rollback and implementation workflow.
 
 Upstream dataset definitions are maintained in [`crypto-history-loader/DATASETS.md`](https://github.com/SergejSchweizer/crypto-history-loader/blob/main/DATASETS.md).
+
+## Existing MLflow service
+
+The project uses an already deployed MLflow instance on the NAS:
+
+```text
+MLFLOW_TRACKING_URI = http://10.10.1.3:5000
+host = 10.10.1.3
+port = 5000
+transport = HTTP
+backend store = PostgreSQL
+ownership = external shared platform service
+```
+
+This repository does **not** deploy MLflow or PostgreSQL. It owns only the client integration, experiment taxonomy, run metadata, dataset lineage, model packaging, registry naming, evidence and promotion rules used by this project.
+
+The following platform properties are not assumed until verified by an explicit adoption work package:
+
+```text
+MLflow server version
+Model Registry and alias support
+artifact storage location and persistence
+artifact upload/download behaviour
+PostgreSQL backup and restore status
+authentication and authorisation
+TLS or reverse-proxy protection
+network exposure beyond the trusted LAN
+```
+
+Until authentication and TLS are verified, the endpoint is treated as a trusted-LAN research service. No exchange credentials, database passwords or other secrets may be logged to it. The URI must not be exposed directly to the public internet.
+
+Client code obtains the endpoint from configuration, with the current deployment as the documented default:
+
+```text
+MLFLOW_TRACKING_URI=http://10.10.1.3:5000
+```
+
+Unit tests remain network-independent. Integration tests that require MLflow are explicitly marked and fail with a clear service-unavailable result when the NAS endpoint cannot be reached.
 
 ## Production V1 defaults
 
@@ -66,6 +104,8 @@ Upstream dataset definitions are maintained in [`crypto-history-loader/DATASETS.
 | Margin mode | isolated |
 | Position mode | one-way |
 | Maximum exposure | absolute notional no greater than allocated equity |
+| Tracking service | `http://10.10.1.3:5000` |
+| Tracking backend | external PostgreSQL-backed MLflow instance |
 | Promotion | manual and atomic |
 
 The selected perpetual must support sufficiently fine sizing. At the configured reference capital, minimum order notional and one quantity-step notional must each be no greater than 1% of allocated equity. For EUR 1,000 equivalent capital, each must therefore be no greater than EUR 10 equivalent in settlement currency.
@@ -122,11 +162,22 @@ implementation_steps
 deterministic_test_fixtures
 acceptance_tests
 required_mlflow_evidence
+external_service_assumptions
 non_goals
 completion_gate
 ```
 
 A backlog item is invalid when any field is unknown.
+
+For MLflow-related work, `external_service_assumptions` must distinguish:
+
+```text
+VERIFIED
+UNVERIFIED
+NOT_REQUIRED
+```
+
+An unverified platform property may not be treated as an implemented capability.
 
 ## Implementation dependency graph
 
@@ -134,29 +185,36 @@ A backlog item is invalid when any field is unknown.
 S00 Foundations
  |
  +--> S10 Data and point-in-time features
- |      |
- |      +--> S20 MLflow tracking foundation
- |      |
- |      +--> S30 Persistent regime estimator
- |      |
- |      +--> S40 Strategy experts and exit research
- |              |
- |              +--> S50 Allocator and regime evidence
- |                      |
- |                      +--> S60 Deterministic risk engine
- |                              |
- |                              +--> S70 Integrated replay and audit
- |                                      |
- |                                      +--> S80 Shadow, paper, canary and promotion
  |
- +--> S90 Alternative regime models
+ +--> S20 Adopt existing NAS MLflow service
+ |      |
+ |      +--> endpoint and capability verification
+ |      +--> run metadata and experiment hierarchy
+ |      +--> dataset and artifact round-trip
+ |      +--> registry and alias verification
+ |      +--> evidence search utilities
  |
- +--> S100 Regime-dependent exits
+ +--> S30 Persistent regime estimator
+ |      depends on S10 and verified S20 model packaging capabilities
  |
- +--> S110 Learned allocators
+ +--> S40 Strategy experts and exit research
+        depends on S10 and verified S20 experiment tracking
+        |
+        +--> S50 Allocator and regime evidence
+                |
+                +--> S60 Deterministic risk engine
+                        |
+                        +--> S70 Integrated replay and audit
+                                |
+                                +--> S80 Shadow, paper, canary and promotion
+
+Post-V1 research after evidence gates:
+S90 Alternative regime models
+S100 Regime-dependent exits
+S110 Learned allocators
 ```
 
-`S90`, `S100` and `S110` start only after the Production V1 evidence stack has passed its required gates.
+The previous plan to deploy a local MLflow/PostgreSQL/object-store stack inside this repository is obsolete. Platform hardening, PostgreSQL backup, artifact-store durability, authentication and TLS are external service dependencies. This project records their verification evidence but does not implement their infrastructure.
 
 ## Atomic stacked pull requests
 
@@ -165,9 +223,9 @@ Future implementation uses small dependency-ordered PRs.
 ### Identity
 
 ```text
-work package: S30-P03
-branch: agent/s30-p03-multi-seed-stability
-PR title: [S30-P03] Implement multi-seed HMM stability
+work package: S20-P02
+branch: agent/s20-p02-mlflow-capability-probe
+PR title: [S20-P02] Verify NAS MLflow capabilities
 ```
 
 ### Stack rules
@@ -177,26 +235,35 @@ PR title: [S30-P03] Implement multi-seed HMM stability
 3. A dependent PR targets its parent branch until the parent merges; it is then rebased onto the new `main` and retargeted.
 4. Every PR is squash-merged so one backlog item produces one deterministic mainline commit.
 5. Contract changes precede implementations that consume them.
-6. Infrastructure, domain behaviour, model research and cleanup are not mixed in one PR.
+6. External platform provisioning and domain behaviour are never mixed in this repository.
 7. Refactoring is allowed only when required by the work package and is listed explicitly.
 8. Each PR includes deterministic tests and fixed seeds where randomness exists.
-9. Research PRs log the required MLflow run, dataset digest, parameters, metrics and artifacts before completion.
+9. Research PRs log the required MLflow run, dataset digest, parameters, metrics and artifacts before completion when the verified service capability permits it.
 10. A child PR cannot merge while its declared parent is unmerged or its compatibility checks fail.
+11. Tests must not create uncontrolled experiments or model versions on the shared instance.
+12. Integration fixtures use a dedicated project-prefixed experiment namespace.
 
 ### Required PR metadata
 
 ```yaml
-work_package_id: S30-P03
+work_package_id: S20-P02
 depends_on:
-  - S30-P02
+  - S20-P01
 base_commit: immutable parent SHA
 contracts_added: []
 contracts_changed: []
-mlflow_experiment: btc-regime/20-regime-model-selection
-deterministic_seeds: [recorded values]
+mlflow_tracking_uri: http://10.10.1.3:5000
+mlflow_experiment: regime-strategy-selector/00-platform-validation
+mlflow_run_role: INTEGRATION_TEST
+deterministic_seeds: []
 acceptance_commands: [exact commands]
-artifacts_expected: [exact paths or MLflow artifacts]
-non_goals: [explicit exclusions]
+artifacts_expected: [exact local or MLflow artifacts]
+external_service_assumptions:
+  postgres_backend: VERIFIED
+  registry_support: UNVERIFIED
+  artifact_persistence: UNVERIFIED
+  authentication: UNVERIFIED
+non_goals: [external MLflow or PostgreSQL provisioning]
 ```
 
 ### Atomicity gate
@@ -210,6 +277,7 @@ the diff contains no unrelated changes
 public contracts remain compatible or are versioned
 tests are deterministic
 MLflow evidence is reproducible when required
+external-service assumptions are explicit
 rollback or disable behaviour is defined
 documentation references the exact work package
 ```
@@ -225,5 +293,7 @@ offline research
 -> small-capital canary
 -> restricted production
 ```
+
+MLflow is used to select and audit deployment artifacts, but the trading runtime must not require the live MLflow endpoint for every decision. Deployment preparation resolves an immutable registered version, materialises the compatible bundle locally, verifies hashes and records the source run and model version. If MLflow later becomes unavailable, new registration and promotion stop, while an already materialised and verified bundle may continue under the normal runtime safety rules.
 
 Promotion and rollback operate on one compatible deployment bundle containing the instrument specification, model, scaler, state mapping, affinity matrix, strategy configuration, exit profiles, risk configuration, cost model, timing policy, code commit and dependency lock.
