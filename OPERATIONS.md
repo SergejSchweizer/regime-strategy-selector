@@ -1,11 +1,11 @@
 # Operations and Model Governance
 
-This document defines Production V1 runtime behaviour, security, monitoring, incident handling, MLflow usage, Model Registry governance, promotion, rollback and implementation work packages for one fixed linear BTC-perpetual deployment.
+This document defines Production V1 runtime behaviour, security, monitoring, incident handling, use of the existing NAS MLflow service, Model Registry governance, promotion, rollback and implementation work packages for one fixed linear BTC-perpetual deployment.
 
 ```text
-operations_version = 2.1.0
-mlflow_governance_version = 1.1.0
-implementation_workflow_version = 1.0.0
+operations_version = 2.2.0
+mlflow_governance_version = 1.2.0
+implementation_workflow_version = 1.1.0
 ```
 
 ## 1. Operating principles
@@ -23,11 +23,94 @@ reconciliation failure = no exposure increase
 artifact mismatch = halt
 manual promotion only
 atomic rollback only
+MLflow is an external shared service
+runtime decisions do not require live MLflow access
 ```
 
 The analytical and execution systems remain independently restartable. Restarting either system must not create duplicate decisions, plans or protective orders.
 
-## 2. Process topology
+## 2. Existing MLflow service baseline
+
+The project adopts the following already deployed service:
+
+```text
+tracking_uri = http://10.10.1.3:5000
+host = 10.10.1.3
+port = 5000
+transport = HTTP
+backend_store = PostgreSQL
+service_location = NAS
+service_ownership = external shared platform
+```
+
+These facts are accepted as the current baseline because they are provided by the operator. They are not inferred from repository code.
+
+The following properties remain `UNVERIFIED` until an integration work package records machine-readable evidence:
+
+```text
+MLflow server version
+API compatibility with the selected client version
+Model Registry availability
+model alias support
+artifact repository type
+artifact upload/download behaviour
+artifact durability across restart
+PostgreSQL persistence across restart
+PostgreSQL backup and restore process
+authentication and authorisation
+TLS or reverse-proxy protection
+network exposure outside the trusted LAN
+```
+
+An unverified property is not a usable production capability.
+
+### 2.1 Current security posture
+
+The current endpoint uses plain HTTP. Until authentication and TLS are verified:
+
+```text
+use only from a trusted private LAN or VPN
+never expose 10.10.1.3:5000 directly to the public internet
+never log exchange credentials, passwords, access tokens or private keys
+never place secrets in parameters, tags, artifact names or artifacts
+assume traffic can be observed by any host with access to the LAN path
+```
+
+The project may use the endpoint for research metadata and non-secret artifacts after the basic capability probe passes. Promotion to paper, canary or production additionally requires the external-platform readiness evidence defined in this document.
+
+## 3. Responsibility boundary
+
+### This repository owns
+
+```text
+MLflow client configuration
+endpoint health and compatibility checks
+project experiment taxonomy
+run roles, tags, parameters and metric namespaces
+dataset references and digests
+project artifacts and model packages
+registered-model naming
+candidate-versus-champion evidence
+promotion and rollback policy
+runtime audit references to immutable model versions
+```
+
+### The external NAS platform owns
+
+```text
+MLflow server process
+PostgreSQL process and persistence
+artifact-store implementation and persistence
+network exposure
+server authentication and authorisation
+TLS and reverse proxy when introduced
+server backup and restore
+server upgrades and database migrations
+```
+
+This repository must not create a second local MLflow, PostgreSQL or object-store stack. It verifies the external service and fails clearly when required capabilities are unavailable.
+
+## 4. Process topology
 
 ```text
 BTC market-data adapter
@@ -40,40 +123,86 @@ decision and audit store
 BTC-perpetual execution service
 portfolio and margin reconciler
 monitoring and alerting
-MLflow Tracking Server and Model Registry
+
+external dependency:
+http://10.10.1.3:5000
+    MLflow Tracking Server and Model Registry
+    PostgreSQL-backed metadata
+    artifact capability to be verified
 ```
 
 Components may initially share a process, but contracts and persisted state remain separate.
 
-## 3. Startup sequence
+## 5. MLflow capability states
+
+The client exposes one platform status:
+
+```text
+UNVERIFIED
+AVAILABLE
+DEGRADED
+UNAVAILABLE
+INCOMPATIBLE
+```
+
+Definitions:
+
+| State | Meaning | Allowed behaviour |
+|---|---|---|
+| `UNVERIFIED` | capability probe has not completed | unit tests and local deterministic work only |
+| `AVAILABLE` | required API, registry and artifact checks pass | research logging, registration and approved promotion operations |
+| `DEGRADED` | tracking works but one non-critical capability fails | existing runs may continue; no registration or promotion |
+| `UNAVAILABLE` | endpoint cannot be reached | no remote logging, registration or promotion |
+| `INCOMPATIBLE` | server/client or schema capability is unsupported | fail integration work until compatibility is resolved |
+
+The status is evaluated per operation. A tracking-only research task may require fewer capabilities than model registration.
+
+## 6. Deployment preparation and runtime separation
+
+### 6.1 Deployment preparation
+
+Deployment preparation may access MLflow and performs:
+
+1. resolve the approved immutable registered-model version;
+2. resolve the source run and artifact references;
+3. download or copy the complete compatible deployment bundle;
+4. verify artifact hashes, signatures, contracts and dependency metadata;
+5. store the bundle in the deployment artifact directory;
+6. persist a deployment manifest containing the exact MLflow identity;
+7. execute golden prediction tests;
+8. mark the bundle as locally materialised and deployment-eligible.
+
+### 6.2 Runtime startup
+
+Runtime startup does **not** resolve `@champion` on every restart. It loads the locally materialised immutable bundle named by `DeploymentConfig.v1`.
 
 Startup proceeds in this order:
 
 1. load `DeploymentConfig.v1`;
 2. verify `target_symbol = BTC`;
 3. load current `CapitalAllocation.v1`;
-4. resolve the approved MLflow champion deployment bundle;
-5. load `CompatibleArtifactSet.v1` atomically;
-6. verify BTC perpetual and spot-reference specifications;
-7. verify code, dependency, feature, methodology, risk, operations and artifact hashes;
+4. load the exact local compatible bundle and deployment manifest;
+5. verify recorded MLflow model name, immutable version and source run;
+6. verify code, dependency, feature, methodology, risk, operations and artifact hashes;
+7. verify BTC perpetual and spot-reference specifications;
 8. connect market data and exchange in read-only mode;
-9. verify the exact configured linear BTC perpetual;
+9. verify the configured linear BTC perpetual;
 10. verify isolated margin, one-way mode and maximum production leverage of 1x;
 11. verify reduce-only support;
-12. reconcile cash, margin, position, open orders and protective orders;
+12. reconcile cash, margin, position, orders and protective orders;
 13. verify mark, index, liquidation and funding data;
 14. verify the system clock;
 15. validate `SmallAccountCapability.v1`;
 16. acquire the deployment leadership lock;
-17. execute golden prediction tests for the loaded model bundle;
+17. execute golden prediction tests for the local bundle;
 18. enable analytical decisions;
 19. enable exposure-changing execution only after every prior check passes.
 
-Any failure leaves the deployment in `SAFE_READ_ONLY` or `HALTED`.
+If MLflow is unavailable during runtime startup but the local bundle is valid, runtime may start under the normal safety rules. If the local bundle is absent, incomplete or hash-invalid, startup fails even when MLflow is reachable.
 
-## 4. Runtime state machines
+## 7. Runtime state machines
 
-### 4.1 Deployment states
+### 7.1 Deployment states
 
 ```text
 STARTING
@@ -100,7 +229,7 @@ HALTED -> SAFE_READ_ONLY only after manual acknowledgement
 
 There is no direct `HALTED -> READY` transition.
 
-### 4.2 Decision states
+### 7.2 Decision states
 
 ```text
 CREATED
@@ -118,7 +247,7 @@ EXPIRED
 
 Transitions are append-only and never move backwards.
 
-## 5. Exactly-once semantics
+## 8. Exactly-once semantics
 
 ```text
 decision_id = hash(
@@ -152,14 +281,14 @@ protective_order_set_id = hash(
 
 At most one active protective-order set exists for the reconciled net position.
 
-## 6. Hourly decision schedule
+## 9. Hourly decision schedule
 
 At every scheduled UTC hour:
 
 1. wait for the final source M1 bucket to close;
 2. verify BTC spot and perpetual watermarks and clock;
 3. build and persist `MarketFeatureFrame.v1`;
-4. run the regime estimator and all enabled experts;
+4. run the locally loaded regime estimator and enabled experts;
 5. run the allocator;
 6. read reconciled position, margin and liquidation state;
 7. run the Risk Engine;
@@ -168,77 +297,40 @@ At every scheduled UTC hour:
 10. create at most one execution plan;
 11. reconcile fills and position;
 12. activate or replace reduce-only protective orders;
-13. append execution and portfolio results to the audit chain.
+13. append execution and portfolio results to the audit chain;
+14. enqueue non-blocking operational metric publication when enabled.
 
-A late decision expires; it does not shift the schedule.
+A late decision expires; it does not shift the schedule. MLflow connectivity is never in the critical hourly decision path.
 
-## 7. Service objectives and automatic actions
-
-All thresholds are versioned in `OperationsConfig.v1` or `RiskLimits.v1`.
-
-| Condition | Default trigger | Automatic action |
-|---|---:|---|
-| Market-data bucket delay | >120 seconds | reject exposure increase |
-| Market-data bucket delay | >600 seconds | `DEGRADED`, reduce-only |
-| Required spot reference unavailable | any required snapshot | feature `FAIL` |
-| Feature computation duration | >30 seconds | expire decision |
-| Decision age at execution | >60 seconds | reject exposure increase |
-| Source gap | >180 minutes | `HALTED` |
-| Feature or artifact hash mismatch | any | `HALTED` |
-| Wrong symbol, instrument or contract type | any | `HALTED` |
-| Margin mode not isolated | any | cancel increasing orders, `HALTED` |
-| Position mode not one-way | any | cancel increasing orders, `HALTED` |
-| Effective leverage configuration >1x | any | startup failure or `HALTED` |
-| Small-account capability | `FAIL` | startup failure |
-| Funding data stale | beyond limit | no exposure increase |
-| Absolute funding rate | above limit | reduce or reject |
-| Mark/index divergence | warning threshold | no exposure increase |
-| Mark/index divergence | halt threshold | reduce-only, `HALTED` |
-| Liquidation buffer | warning threshold | clip, reduce-only |
-| Liquidation buffer | hard limit | emergency reduction, `HALTED` |
-| Reconciliation | `BROKEN` | cancel non-reduce-only orders |
-| Reconciliation broken duration | >300 seconds | `HALTED` |
-| Pending execution-plan age | >120 seconds | stop new plans, reconcile |
-| Exchange-order age | above TTL | cancel and reconcile |
-| Regime entropy | above limit | abstain |
-| Maximum regime probability | below limit | abstain |
-| Daily loss or drawdown | limit reached | reduce or flatten, `HALTED` |
-| Kill switch | active | cancel, emergency reduce or flatten |
-| Clock offset | >500 milliseconds | disable exposure increase |
-| Realised slippage | >2x expected for 3 plans | `DEGRADED`, reduce target-change cap |
-| Cost-model error | above tolerance | block promotion and alert |
-
-Emergency reduction and flattening are deterministic and never inferred by a model.
-
-## 8. Safe degradation
+## 10. Safe degradation
 
 Feature failure, inference failure, allocator abstention, risk rejection, high entropy, stale capital or cost state, mark/index divergence, insufficient liquidation buffer, broken reconciliation, execution connectivity loss and decision expiry allow only preservation or reduction of absolute exposure.
 
-A target of zero is not a confirmed flat position. The system may claim flat only after exchange reconciliation.
+MLflow failures have these effects:
 
-Production V1 has no fallback asset, fallback spot execution, fallback perpetual contract or automatic fallback model.
+| Failure | Runtime effect |
+|---|---|
+| tracking unavailable during research run start | fail the integration run before expensive computation unless offline mode is explicitly allowed |
+| tracking unavailable after a research run starts | retain local recovery manifest; mark the run incomplete; do not claim evidence was logged |
+| Registry unavailable | block model registration and deployment preparation |
+| alias operation unavailable | block promotion and rollback-alias changes |
+| artifact download unavailable | block new deployment preparation |
+| MLflow unavailable during hourly runtime | continue using the verified local bundle; alert; block promotion only |
+| local bundle invalid | halt regardless of MLflow availability |
 
-## 9. Execution requirements
+There is no automatic fallback model.
 
-Execution converts approved notional into exchange-valid quantity using reference price, contract multiplier and quantity step, rounding towards zero.
+## 11. Security
 
-```text
-delta_notional = approved_target_notional - reconciled_current_notional
-```
+Production exchange API keys must have trading permission only, no withdrawal permission, sub-account restriction, IP allow-listing when available and no unnecessary instrument permissions.
 
-Execution never infers a target from raw signals. Protective exits and degradation-driven reductions use reduce-only. A reduce-only rejection is a reconciliation event, not permission to send an unrestricted replacement.
-
-The account holds one net position in one-way mode and uses isolated margin. Funding observations, held position, realised funding cash flow and cumulative funding are recorded for every funding event.
-
-## 10. Security
-
-Production API keys must have trading permission only, no withdrawal permission, sub-account restriction, IP allow-listing when available and no unnecessary instrument permissions.
-
-Secrets come from an approved secret manager and are prohibited in Git, model artifacts, images, plaintext configuration, notebooks and logs.
+Secrets come from an approved secret manager and are prohibited in Git, model artifacts, MLflow parameters, MLflow tags, artifact names, images, plaintext configuration, notebooks and logs.
 
 Paper, canary and production use separate credentials and preferably separate accounts or sub-accounts. Promotion, capital changes, risk changes and kill-switch release require authenticated, auditable operator actions.
 
-## 11. Logging and audit
+The MLflow endpoint configuration is non-secret. Future username/password values are secret and must be supplied only through the approved environment or secret mechanism.
+
+## 12. Logging and audit
 
 Every service emits:
 
@@ -255,16 +347,16 @@ result code
 incident_id when present
 ```
 
-Logs contain no credentials. `DecisionAuditRecord.v1` is immutable; corrections append a new record referencing the original hash.
-
-Every runtime decision records the exact MLflow identity:
+Every deployment and runtime decision records:
 
 ```text
+mlflow_tracking_uri = http://10.10.1.3:5000
 mlflow_registered_model_name
 mlflow_model_version
-mlflow_model_alias_at_decision_time
+mlflow_model_alias_at_deployment_time
 source_run_id
 artifact_sha256
+bundle_materialised_at
 output_contract_version
 state_schema_version
 feature_set_hash
@@ -273,9 +365,9 @@ code_commit
 dependency_lock_hash
 ```
 
-The resolved immutable model version, not only the alias, is mandatory for audit.
+The immutable model version is mandatory. The alias alone is insufficient.
 
-## 12. Monitoring
+## 13. Monitoring
 
 ### Data and features
 
@@ -296,17 +388,9 @@ The resolved immutable model version, not only the alias, is mandatory for audit
 - inference latency;
 - invalid probability count.
 
-### Strategy and allocation
-
-- expert direction, strength and confidence;
-- contribution weights and disagreement;
-- consensus direction and cash weight;
-- regime certainty and volatility multiplier;
-- preliminary target and selected exit profile.
-
 ### Risk and execution
 
-- current and approved fraction and notional;
+- approved fraction and notional;
 - isolated margin use;
 - mark/index divergence and liquidation buffer;
 - funding and realised funding;
@@ -315,22 +399,18 @@ The resolved immutable model version, not only the alias, is mandatory for audit
 - order age, fill latency, fees and slippage;
 - reconciliation status.
 
-## 13. Alerts and runbooks
+### MLflow integration
 
-Each alert defines:
-
-```yaml
-alert_id: string
-severity: INFO|WARNING|CRITICAL
-detection_rule: string
-automatic_action: string
-operator_action: string
-runbook_url: string
-owner: string
-acknowledgement_deadline_seconds: integer
-```
-
-Critical alerts include wrong instrument, changed contract semantics, margin or position-mode drift, leverage above 1x, artifact incompatibility, prolonged broken reconciliation, missing liquidation price, liquidation-buffer breach, loss-limit breach, kill switch, duplicate execution, unrecognised position, inability to cancel increasing orders and secret failure.
+- endpoint reachability;
+- server version and client compatibility;
+- request latency;
+- failed run creations;
+- failed metric and artifact writes;
+- artifact round-trip status;
+- Registry and alias capability status;
+- incomplete-run recovery manifests;
+- age of last successful platform validation;
+- age of external PostgreSQL and artifact backup evidence when supplied by the platform operator.
 
 ## 14. Deployment environments
 
@@ -343,15 +423,62 @@ historical replay
 -> restricted production
 ```
 
-Historical replay uses production decision code with historical adapters. Feature shadow has no execution. Decision shadow persists full decisions but sends no approvals. Paper runs the production execution state machine against a paper venue or deterministic simulator. Canary uses a dedicated small allocation, strict loss limits and reduced target changes. Restricted production retains conservative limits and never exceeds absolute fraction 1.0.
+Historical replay uses production decision code with historical adapters. Feature shadow has no execution. Decision shadow persists full decisions but sends no approvals. Paper uses a paper venue or deterministic simulator. Canary uses a dedicated small allocation, strict loss limits and reduced target changes.
 
 # MLflow usage
 
-## 15. MLflow responsibility boundary
+## 15. Client configuration
 
-MLflow is the experiment and model control plane.
+The current default configuration is:
 
-### MLflow owns
+```text
+MLFLOW_TRACKING_URI=http://10.10.1.3:5000
+```
+
+Configuration rules:
+
+```text
+the URI is loaded from typed configuration
+the documented default may be overridden explicitly
+the resolved URI is logged in integration evidence
+unit tests use an in-memory fake or local test double, never the NAS endpoint
+integration tests use a dedicated project-prefixed experiment
+timeouts and retry counts are finite and versioned
+no automatic fallback to local ./mlruns
+```
+
+Authentication variables are optional only while the server is verified as unauthenticated:
+
+```text
+MLFLOW_TRACKING_USERNAME
+MLFLOW_TRACKING_PASSWORD
+```
+
+When authentication is enabled externally, client work introduces credentials through secrets without changing experiment or model identity.
+
+## 16. Adoption verification order
+
+The first MLflow stack verifies the existing service in this order:
+
+1. TCP and HTTP reachability of `10.10.1.3:5000`;
+2. health endpoint or API-level health request;
+3. server version and client compatibility;
+4. create, read and terminate a project-prefixed test run;
+5. log and retrieve parameters, tags and metrics;
+6. upload and download a deterministic checksum artifact;
+7. restart-persistence evidence supplied or executed by the platform owner;
+8. create or verify the project experiment namespace;
+9. register a disposable test model version;
+10. verify model version retrieval;
+11. verify alias creation, movement and removal;
+12. clean up disposable resources when supported;
+13. persist `mlflow_capability_report.json`.
+
+The capability report distinguishes `PASS`, `FAIL`, `UNVERIFIED` and `NOT_SUPPORTED` for every feature.
+
+## 17. MLflow responsibility boundary
+
+MLflow owns:
 
 ```text
 experiment organisation
@@ -369,7 +496,7 @@ promotion evidence references
 system metrics for training and inference runs
 ```
 
-### MLflow does not own
+MLflow does not own:
 
 ```text
 raw historical data
@@ -386,177 +513,40 @@ risk-engine state
 execution and reconciliation state
 ```
 
-## 16. Recommended MLflow infrastructure
+## 18. MLflow modules and use
+
+### Tracking
+
+Use Tracking for reproducible training, validation, backtest, comparison, shadow, paper and canary runs. Inner-validation and untouched outer-test results use distinct run roles.
+
+### Dataset tracking
+
+Log immutable references, digests, schema hashes and contexts for training, validation, testing, shadow, paper and canary frames. Do not upload the historical lake merely to duplicate storage.
+
+### Artifact logging
+
+Log structured evidence including dataset manifests, split manifests, feature schemas, state signatures, state mappings, equity curves, trade ledgers, cost reports, bootstrap reports, placebo reports, golden fixtures and deployment manifests.
+
+### Custom model packaging
+
+Every promotable regime estimator uses one common MLflow PyFunc-compatible interface. The wrapper owns feature validation, ordering, scaling, filtered inference, four-hour projection, persistent-state mapping, canonical probability order, entropy and output validation.
+
+### Signatures and examples
+
+Every logged model contains an input signature, output signature, representative input example, serving input example and reconstructable dependency environment.
+
+### Model Registry
+
+Use project-qualified registered model names:
 
 ```text
-GitHub
-    source code, contracts, configs and tests
-
-MLflow Tracking Server
-    experiments, runs, parameters, metrics, lineage and registry metadata
-
-PostgreSQL
-    MLflow backend store
-
-MinIO or S3-compatible storage
-    run and model artifacts
-
-Runtime PostgreSQL
-    filtered probabilities, decisions, positions and audit
-
-Parquet or analytical database
-    historical market data and feature frames
+regime-strategy-selector--regime-estimator
+regime-strategy-selector--deployment-bundle
 ```
 
-The MLflow backend and runtime database are logically separated. Research workers interact with the Tracking Server; direct artifact-store credentials should be avoided when the server proxies artifacts.
+The deployment bundle contains or references the exact estimator, scaler, feature contract, state schema, mapping, affinity matrix, strategy configuration, exits, risk configuration, cost model, timing policy, code commit and dependency lock.
 
-## 17. MLflow modules and exact use
-
-### 17.1 Tracking
-
-Use MLflow Tracking for every reproducible training, validation, backtest, comparison, shadow, paper and canary run.
-
-Primary responsibilities:
-
-```text
-start and terminate runs
-group runs into experiments
-record immutable parameters
-record time-series and scalar metrics
-attach semantic tags
-log artifacts
-search and compare runs
-link child runs to parent runs
-```
-
-A run must have one semantic role. Inner-validation and untouched outer-test results are never written to the same run role.
-
-### 17.2 Dataset tracking
-
-Use MLflow dataset inputs for:
-
-```text
-inner training frame
-inner validation frame
-outer test frame
-shadow evaluation frame
-paper evaluation frame
-canary evaluation frame
-```
-
-MLflow stores the source URI, digest, schema and profile reference. It does not duplicate the complete historical lake.
-
-Each dataset input is assigned a context:
-
-```text
-training
-validation
-testing
-shadow
-paper
-canary
-```
-
-### 17.3 Artifact logging
-
-Use run artifacts for structured outputs that do not fit scalar parameters or metrics:
-
-```text
-dataset manifests
-walk-forward split manifests
-feature schemas
-model parameters
-scalers
-state signatures
-state mappings
-equity curves
-trade ledgers
-cost breakdowns
-bootstrap reports
-placebo reports
-golden prediction fixtures
-deployment manifests
-```
-
-### 17.4 Custom model packaging
-
-Package every promotable regime estimator behind one common MLflow PyFunc-compatible interface, preferably using Models From Code when supported by the selected MLflow version.
-
-The wrapper owns:
-
-```text
-feature validation
-feature ordering
-scaling
-raw model inference
-filtered probability calculation
-four-hour probability projection
-persistent-state mapping
-canonical probability ordering
-entropy and maximum-probability calculation
-output validation
-```
-
-The public output is always `RegimePrediction.v1`.
-
-### 17.5 Model signatures and input examples
-
-Every logged model includes:
-
-```text
-input signature
-output signature
-representative input example
-serving input example
-dependency environment
-```
-
-Schema validation supplements but does not replace domain invariants.
-
-Required domain invariants:
-
-```text
-all probabilities are finite and in [0,1]
-current and forward vectors each sum to 1
-state order equals the registered persistent-state schema
-only filtered point-in-time probabilities are returned
-feature and artifact hashes match
-```
-
-### 17.6 Model Registry
-
-Use two registered models:
-
-```text
-btc-regime-estimator
-btc-regime-deployment-bundle
-```
-
-`btc-regime-estimator` stores statistically and economically evaluated estimator versions.
-
-`btc-regime-deployment-bundle` stores or references the complete compatible set:
-
-```text
-regime estimator version
-scaler
-feature contract
-state schema
-state mapping
-affinity matrix
-strategy configuration
-exit profile set
-risk configuration
-cost model
-timing policy
-code commit
-dependency lock
-```
-
-Production loads the deployment bundle and never independently selects the latest component versions.
-
-### 17.7 Aliases
-
-Use aliases that point to immutable versions:
+### Aliases
 
 ```text
 @champion
@@ -565,69 +555,36 @@ Use aliases that point to immutable versions:
 @rollback
 ```
 
-Runtime reference:
+Aliases may be used for operator selection. Deployment manifests always record the resolved immutable version.
+
+### Model evaluation
+
+MLflow model evaluation may be used for conventional supervised diagnostics. Path-dependent financial evaluation remains in project code and its results are logged to MLflow.
+
+### System metrics
+
+Enable system metrics for multi-seed model training, alternative model training, large walk-forward evaluation, bootstrap evaluation and deployment-stage inference diagnostics.
+
+### Search and reporting
+
+Search queries must filter by project, run role, experiment-design version, dataset digest and code commit before metrics are compared.
+
+## 19. Experiment taxonomy
 
 ```text
-models:/btc-regime-deployment-bundle@champion
+regime-strategy-selector/00-platform-validation
+regime-strategy-selector/10-data-and-feature-validation
+regime-strategy-selector/20-standalone-exit-optimisation
+regime-strategy-selector/30-regime-model-selection
+regime-strategy-selector/40-regime-incremental-value
+regime-strategy-selector/50-regime-dependent-exits
+regime-strategy-selector/60-learned-allocator
+regime-strategy-selector/90-shadow-paper-canary
 ```
 
-Every alias movement records actor, timestamp, reason, previous version, target version and evidence report.
+The platform-validation experiment is reserved for deterministic integration checks. It must not contain financial research evidence.
 
-### 17.8 Model evaluation
-
-Use MLflow model evaluation only for conventional supervised diagnostics introduced by later model families, such as regression, classification or probability calibration.
-
-Path-dependent financial evaluation remains in the project backtester. Drawdown, Calmar, stops, funding, execution costs, turnover, block bootstrap and liquidation behaviour are computed by project code and logged to MLflow.
-
-### 17.9 System metrics
-
-Enable MLflow system metrics for computationally significant runs:
-
-```text
-multi-seed HMM training
-alternative model training
-large walk-forward evaluation
-bootstrap evaluation
-shadow inference
-paper inference
-canary inference
-```
-
-Use them to compare CPU, memory, disk and inference-time requirements across candidates. Operational cost does not replace economic evidence but is a promotion diagnostic.
-
-### 17.10 Search and reporting
-
-Use the MLflow search API and UI to construct:
-
-```text
-candidate-versus-champion tables
-seed stability tables
-outer-fold comparisons
-exit robustness tables
-failed-run inventories
-promotion evidence summaries
-shadow, paper and canary dashboards
-```
-
-Queries must filter by run role, experiment-design version, dataset digest and code commit before comparing metrics.
-
-## 18. MLflow experiment taxonomy
-
-Use separate experiments for separate causal questions:
-
-```text
-btc-regime/00-data-and-feature-validation
-btc-regime/10-standalone-exit-optimisation
-btc-regime/20-regime-model-selection
-btc-regime/30-regime-incremental-value
-btc-regime/40-regime-dependent-exits
-btc-regime/50-learned-allocator
-btc-regime/90-shadow-paper-canary
-```
-
-Do not place all research in one experiment.
-
-## 19. MLflow run hierarchy
+## 20. Run hierarchy
 
 A parent run represents one reproducible experiment definition:
 
@@ -643,38 +600,21 @@ code commit
 dependency lock
 ```
 
-Child runs represent:
-
-```text
-deterministic seed
-inner fold
-hyperparameter combination
-exit-profile combination
-cost scenario
-placebo variant
-bootstrap summary
-```
-
-```text
-parent: candidate x outer_fold
-    |-- child: seed
-    |-- child: inner_fold x parameter combination
-    |-- child: BASE cost
-    |-- child: ELEVATED cost
-    `-- child: SEVERE cost
-```
+Child runs represent deterministic seeds, inner folds, hyperparameter combinations, exit profiles, cost scenarios, placebo variants and bootstrap summaries.
 
 Outer-test results are logged only after inner selection is complete and frozen.
 
-## 20. Required MLflow tags
+## 21. Required tags
 
 ```text
 project = regime-strategy-selector
+repository = SergejSchweizer/regime-strategy-selector
 work_package_id = string
+tracking_uri = http://10.10.1.3:5000
 target_symbol = BTC
 traded_instrument_type = LINEAR_PERPETUAL
-run_role = INNER_TRAIN|INNER_VALIDATION|OUTER_TEST|PLACEBO|SHADOW|PAPER|CANARY
-candidate_role = BASELINE|CHAMPION|CHALLENGER
+run_role = INTEGRATION_TEST|INNER_TRAIN|INNER_VALIDATION|OUTER_TEST|PLACEBO|SHADOW|PAPER|CANARY
+candidate_role = BASELINE|CHAMPION|CHALLENGER|NOT_APPLICABLE
 model_family = string
 strategy_id = TREND|MOMENTUM|MEAN_REVERSION|ALLOCATOR|NONE
 state_schema_version = string
@@ -686,76 +626,20 @@ alignment_status = PASS|FAIL|NOT_APPLICABLE
 promotion_eligible = true|false
 ```
 
-Tags identify semantics; they do not replace metrics.
+## 22. Required parameters and metrics
 
-## 21. Required MLflow parameters
+Common parameters include fold windows, purge and embargo, horizons, random seed, code commit, dependency lock hash, dataset identity and digest, feature-set hash, risk config version and cost model version.
 
-### Common parameters
+Statistical metrics include predictive log likelihood, seed convergence and stability, state occupancy and duration, alignment distance, entropy, transition stability, signature stability, invalid probability count and inference latency.
 
-```text
-outer_fold_id
-inner_fold_id
-training_start
-training_end
-validation_start
-validation_end
-test_start
-test_end
-embargo_hours
-purge_hours
-decision_interval_minutes
-primary_horizon_hours
-stress_horizon_hours
-random_seed
-code_commit
-dependency_lock_hash
-dataset_name
-dataset_version
-dataset_digest
-feature_set_hash
-risk_config_version
-cost_model_version
-```
+Economic metrics include net return, annualised return, Calmar, Sharpe, Sortino, maximum drawdown, CVaR, turnover, trade count, profit factor, fold concentration, slippage and spread cost.
 
-### Regime-model parameters
+Candidate comparisons include paired differences, outer-fold win fraction and paired bootstrap confidence intervals.
+
+Every metric uses a scope prefix:
 
 ```text
-model_family
-model_implementation_version
-n_states
-covariance_type
-n_initialisations
-convergence_tolerance
-maximum_iterations
-minimum_state_occupancy
-maximum_state_alignment_distance
-scaler_type
-scaler_version
-```
-
-### Exit and allocator parameters
-
-```text
-strategy_id
-exit_search_space_version
-stop_atr_multiple
-take_profit_atr_multiple
-time_stop_hours
-trailing_stop_enabled
-selection_rule_version
-affinity_method_version
-minimum_cash_fraction
-minimum_consensus_evidence
-minimum_direction_dominance
-target_volatility_annual
-volatility_floor
-```
-
-## 22. MLflow metric namespace
-
-Prefix every metric by scope:
-
-```text
+platform/
 train/
 inner_validation/
 outer_test/
@@ -769,103 +653,21 @@ canary/
 system/
 ```
 
-### Statistical regime metrics
+## 23. Required artifacts
+
+### Platform adoption
 
 ```text
-oos_predictive_log_likelihood
-one_state_log_likelihood_difference
-converged_seed_count
-stable_seed_count
-minimum_state_occupancy
-maximum_state_occupancy
-minimum_median_state_duration_hours
-maximum_median_state_duration_hours
-maximum_seed_alignment_distance
-maximum_fold_alignment_distance
-mean_normalised_entropy
-entropy_p95
-mean_maximum_probability
-transition_matrix_stability
-state_signature_stability
-invalid_probability_count
-inference_latency_ms
+mlflow_capability_report.json
+mlflow_server_version.json
+mlflow_client_compatibility.json
+tracking_roundtrip_report.json
+artifact_roundtrip_report.json
+registry_roundtrip_report.json
+external_platform_evidence_manifest.json
 ```
 
-### Economic metrics
-
-```text
-net_return
-annualised_net_return
-net_calmar
-net_sharpe
-net_sortino
-maximum_drawdown
-cvar_95_loss
-turnover
-trade_count
-win_rate
-profit_factor
-average_trade_net_return
-median_trade_net_return
-maximum_positive_pnl_fold_contribution
-profitable_fold_fraction
-expected_slippage_bps
-realised_slippage_bps
-spread_cost_bps
-```
-
-### Exit robustness metrics
-
-```text
-neighbourhood_score_mean
-neighbourhood_score_std
-neighbourhood_worst_score
-parameter_sensitivity_rank
-score_relative_to_inner_best
-```
-
-### Candidate-versus-baseline metrics
-
-```text
-calmar_difference
-net_return_difference
-maximum_drawdown_difference
-cvar_95_loss_difference
-turnover_difference
-outer_fold_win_fraction
-paired_bootstrap_calmar_ci_lower
-paired_bootstrap_calmar_ci_upper
-paired_bootstrap_net_return_ci_lower
-paired_bootstrap_net_return_ci_upper
-```
-
-## 23. Dataset lineage
-
-MLflow stores immutable references and hashes, not the complete historical lake.
-
-Every run logs:
-
-```text
-dataset_name
-dataset_version
-dataset_uri
-dataset_digest
-dataset_schema_hash
-source_data_hash
-feature_set_hash
-feature_build_commit
-coverage_start
-coverage_end
-row_count
-symbol
-exchange
-```
-
-A mutable path such as `latest.parquet` is insufficient. The dataset digest used by a child run must match its parent experiment definition.
-
-## 24. Required MLflow artifacts
-
-### Data and splits
+### Data and model research
 
 ```text
 dataset_manifest.json
@@ -873,47 +675,20 @@ feature_schema.json
 feature_order.json
 walk_forward_splits.json
 point_in_time_validation_report.json
-missingness_report.json
-historical_live_parity_report.json
-```
-
-### Regime model
-
-```text
 raw_model.bin
 scaler.json
 transition_matrix.json
-initial_state_probabilities.json
 state_signatures.json
 state_mapping.json
 alignment_report.json
 model_signature.json
-probability_contract.json
 seed_stability_report.json
-```
-
-### Strategy and exits
-
-```text
-strategy_config.json
-exit_search_space.json
-selected_exit_profile.json
-exit_surface.parquet
-exit_robustness_report.json
-standalone_strategy_report.json
-```
-
-### Economic evaluation
-
-```text
 fold_metrics.parquet
 equity_curve.parquet
 trade_ledger.parquet
-cost_breakdown.parquet
 bootstrap_report.json
 placebo_report.json
 cost_stress_report.json
-benchmark_comparison.json
 candidate_evidence_report.json
 ```
 
@@ -930,16 +705,16 @@ exit_profile_set.json
 dependency_lock.txt
 ```
 
-## 25. Registration gates
+## 24. Registration and promotion gates
 
-Before registering a model:
+Before registration:
 
 ```text
+platform capability required for the operation is AVAILABLE
 save/load preserves output
 identical input and artifact reproduce probabilities
-golden prediction vectors match tolerance
-wrong feature order fails
-wrong feature hash fails
+golden vectors match tolerance
+wrong feature order or hash fails
 unknown state mapping fails
 invalid probability sums fail
 dependency environment is reconstructable
@@ -947,23 +722,15 @@ statistical outer-test evidence exists
 economic outer-test evidence exists when required
 ```
 
-A research run may be retained without registration.
-
-## 26. Promotion policy
-
-MLflow stores evidence but does not decide promotion. The project promotion service performs the decision.
-
-Required sequence:
+Promotion sequence:
 
 ```text
-search promotion-eligible candidates
+search eligible candidates
 resolve current champion
-verify identical comparison folds and dataset digests
-verify contract and bundle compatibility
-evaluate statistical gates
-evaluate economic gates
-verify paired bootstrap
-verify BASE, ELEVATED and SEVERE cost scenarios
+verify identical folds and dataset digests
+verify contracts and bundle compatibility
+evaluate statistical and economic gates
+verify paired bootstrap and cost stress
 register immutable candidate
 assign @challenger
 run shadow
@@ -973,177 +740,76 @@ run canary
 require manual approval
 move previous @champion to @rollback
 move candidate to @champion
+materialise and verify the selected immutable bundle
 ```
 
-A higher point estimate alone is insufficient.
+If Registry or alias capability is unavailable, promotion is blocked. A higher point estimate alone is insufficient.
 
-## 27. Rollback
+## 25. External platform readiness evidence
 
-Rollback:
-
-1. disables exposure increases;
-2. reconciles the position and orders;
-3. activates the previous complete signed bundle;
-4. verifies hashes, contract identity, margin mode and position mode;
-5. executes a dry decision;
-6. resumes in `SAFE_READ_ONLY`;
-7. requires manual transition to `READY`.
-
-Partial rollback is prohibited.
-
-## 28. Runtime state is not a model artifact
-
-The Model Registry must not store:
+Before paper, canary or production promotion, the platform operator must provide or execute evidence for:
 
 ```text
-last_processed_as_of
-current probabilities
-current position
-open orders
-protective orders
-current drawdown
-daily loss
+PostgreSQL data persists across controlled restart
+artifacts persist across controlled restart
+PostgreSQL backup exists and is restorable
+artifact backup exists and is restorable
+server version is pinned or recorded
+network exposure is limited to approved hosts
+public internet exposure is absent
+authentication status is documented
+TLS status is documented
+operator and recovery contacts are documented
 ```
 
-These belong in the runtime state and audit database.
-
-## 29. Reproducibility, retention and access
-
-Registered model versions, outer-test reports, dataset digests and code commits are immutable. Failed runs are retained for audit and multiple-testing control. Promoted or previously promoted artifacts are not deleted while referenced.
-
-The Tracking Server requires authentication and network restriction. Research workers may create runs but cannot move `@champion`; alias movement requires elevated permission and is auditable.
-
-## 30. Backup and recovery
-
-Back up:
-
-```text
-deployment and capital configurations
-compatible deployment bundles
-model and allocator artifacts
-instrument specifications
-decision state
-execution plans
-exchange acknowledgements
-reconciliation snapshots
-audit records
-incident records
-MLflow backend database
-artifact store
-```
-
-Recovery testing must reconstruct analytical state and reconcile the live position without duplicate execution.
+This repository stores references and checksums for that evidence. It does not implement the external infrastructure.
 
 # Implementation workflow
 
-## 31. Deterministic stacked PR protocol
+## 26. Deterministic stacked PR protocol
 
-A work package produces exactly one primary PR unless the package table explicitly defines multiple PRs.
-
-### Branch and title
+A work package produces exactly one primary PR unless explicitly split.
 
 ```text
 branch = agent/<lowercase-work-package-id>-<short-description>
 title = [<WORK_PACKAGE_ID>] <imperative outcome>
 ```
 
-Example:
+Every PR declares exact parents, base commit, owned files, deterministic fixtures, acceptance commands, MLflow requirements, external-service assumptions, rollback and non-goals.
+
+A PR must not combine unrelated refactoring, multiple model families, research selection and production promotion, external platform provisioning and trading logic, or cleanup unrelated to the work package.
+
+## 27. S20: Adopt the existing NAS MLflow service
+
+| ID | Objective | Depends on | Completion gate |
+|---|---|---|---|
+| S20-P01 | Add typed MLflow client configuration with default URI `http://10.10.1.3:5000` | S00-P02 | configuration and override tests pass |
+| S20-P02 | Implement finite-timeout reachability, version and compatibility probe | S20-P01 | deterministic capability report |
+| S20-P03 | Implement project experiment naming and common run metadata | S20-P02 | metadata contract tests pass |
+| S20-P04 | Implement run, parameter, metric and tag round-trip in the validation experiment | S20-P03 | tracking round-trip passes |
+| S20-P05 | Implement dataset-input and checksum-artifact round-trip | S20-P04, S10-P01 | lineage and artifact reports pass |
+| S20-P06 | Verify Model Registry model-version operations | S20-P05 | disposable registration round-trip passes |
+| S20-P07 | Verify alias operations and permission failure handling | S20-P06 | alias capability report passes or records `NOT_SUPPORTED` |
+| S20-P08 | Implement parent/child runs and run-role validation | S20-P04 | invalid role mixing fails |
+| S20-P09 | Implement metric namespace validation | S20-P08 | unscoped metrics fail |
+| S20-P10 | Implement run search and evidence-summary utilities | S20-P09 | deterministic candidate tables |
+| S20-P11 | Implement incomplete-run local recovery manifests | S20-P04 | interrupted logging recovery test passes |
+| S20-P12 | Add external-platform readiness evidence schema and validation | S20-P02 | missing production prerequisites fail closed |
+
+Removed from this repository plan:
 
 ```text
-branch = agent/s20-p02-common-run-metadata
-title = [S20-P02] Implement common MLflow run metadata
+local PostgreSQL deployment
+local MLflow server deployment
+local object-store deployment
+reverse-proxy deployment
+server authentication provisioning
+server backup implementation
 ```
 
-### Parent relation
+These are owned by the external NAS platform.
 
-Every PR declares:
-
-```yaml
-work_package_id: S20-P02
-depends_on:
-  - S20-P01
-base_commit: exact parent SHA
-stack_parent_branch: agent/s20-p01-mlflow-client
-```
-
-A dependent PR initially targets its stack parent. After the parent is squash-merged, the child is rebased onto the resulting mainline commit, its base is changed to `main`, and its diff is revalidated.
-
-### Atomicity
-
-One PR may change:
-
-```text
-one contract
-or one implementation slice
-or one deterministic test layer
-or one integration boundary
-```
-
-A PR must not combine:
-
-```text
-unrelated refactoring
-multiple model families
-research selection and production promotion
-infrastructure provisioning and trading logic
-contract redesign and downstream feature expansion
-cleanup unrelated to the work package
-```
-
-### Determinism
-
-Every PR defines:
-
-```text
-fixed random seeds
-fixed fixture timestamps
-fixed dataset digest or synthetic fixture version
-stable ordering
-explicit numerical tolerance
-exact acceptance commands
-expected artifact names
-```
-
-Tests may not depend on wall-clock time, mutable `latest` paths, unordered iteration, unrecorded random state or network responses.
-
-### Review and merge
-
-```text
-one work package
--> one reviewable diff
--> deterministic CI
--> required MLflow evidence
--> squash merge
--> one mainline commit
-```
-
-A child cannot merge before its parent. A PR is retested after every rebase.
-
-## 32. Required PR body
-
-```yaml
-work_package_id: string
-objective: one observable outcome
-depends_on: [work package IDs]
-base_commit: SHA
-contracts_added: [contract versions]
-contracts_changed: [contract versions]
-files_owned: [paths]
-implementation_summary: [ordered steps]
-acceptance_commands: [exact commands]
-deterministic_fixtures: [fixture IDs]
-mlflow_experiment: exact name or NOT_APPLICABLE
-mlflow_run_role: exact role or NOT_APPLICABLE
-mlflow_parameters: [required keys]
-mlflow_metrics: [required keys]
-mlflow_artifacts: [required paths]
-rollback_or_disable_path: description
-non_goals: [explicit exclusions]
-```
-
-The PR is incomplete when one field required by its work package is omitted.
-
-## 33. Foundation and platform work packages
+## 28. Other foundation and platform work packages
 
 ### S00: Foundations
 
@@ -1153,19 +819,6 @@ The PR is incomplete when one field required by its work package is omitted.
 | S00-P02 | Implement canonical configuration loading and version validation | S00-P01 | invalid config fails closed |
 | S00-P03 | Implement shared IDs, hashing, clocks and deterministic fixtures | S00-P02 | stable IDs and fixture suite |
 | S00-P04 | Generate typed public contracts from architecture schemas | S00-P02 | schema compatibility tests pass |
-
-### S20: MLflow tracking foundation
-
-| ID | Objective | Depends on | Completion gate |
-|---|---|---|---|
-| S20-P01 | Add Tracking Server client configuration and health checks | S00-P02 | configured client and failure tests |
-| S20-P02 | Implement common run tags and parameters | S20-P01 | metadata contract tests pass |
-| S20-P03 | Implement dataset input and artifact logging helpers | S20-P02, S10-P01 | lineage integration tests pass |
-| S20-P04 | Implement experiment naming, parent/child runs and run-role validation | S20-P02 | invalid run-role mixing fails |
-| S20-P05 | Implement metric namespace validation | S20-P04 | unscoped metrics fail |
-| S20-P06 | Implement run search and evidence-summary utilities | S20-P05 | deterministic candidate tables |
-| S20-P07 | Add local PostgreSQL and object-store deployment configuration | S20-P01 | restart and persistence test |
-| S20-P08 | Add authentication, least privilege and alias permission policy | S20-P07 | access-control tests or runbook |
 
 ### S60: Deterministic risk engine
 
@@ -1185,60 +838,49 @@ The PR is incomplete when one field required by its work package is omitted.
 | S70-P02 | Implement historical execution simulator | S70-P01 | timing and adverse-fill tests |
 | S70-P03 | Implement immutable decision audit chain | S70-P01 | hash-chain replay test |
 | S70-P04 | Implement complete cost and funding accounting | S70-P02 | ledger reconciliation passes |
-| S70-P05 | Build compatible deployment bundle | S70-P03, S70-P04, S20-P03 | bundle compatibility test |
-| S70-P06 | Register candidate bundle and golden predictions | S70-P05, S30-P07 | registration gates pass |
+| S70-P05 | Build compatible deployment bundle | S70-P03, S70-P04, S20-P05 | bundle compatibility test |
+| S70-P06 | Register candidate bundle and golden predictions | S70-P05, S30-P07, S20-P06 | registration gates pass |
 
 ### S80: Deployment and promotion
 
 | ID | Objective | Depends on | Completion gate |
 |---|---|---|---|
-| S80-P01 | Implement startup compatibility and golden-prediction checks | S70-P06 | unsafe bundle cannot start |
+| S80-P01 | Implement immutable bundle materialisation and startup checks | S70-P06 | runtime starts without live MLflow when local bundle is valid |
 | S80-P02 | Implement runtime decision and execution state machines | S80-P01 | restart and idempotency tests |
 | S80-P03 | Implement feature and decision shadow modes | S80-P02 | shadow parity report |
-| S80-P04 | Implement paper execution and reconciliation | S80-P03 | paper readiness gates |
+| S80-P04 | Implement paper execution and reconciliation | S80-P03, S20-P12 | paper readiness gates |
 | S80-P05 | Implement canary controls and monitoring | S80-P04 | canary readiness gates |
-| S80-P06 | Implement registry alias promotion service | S80-P05, S20-P08 | audited alias movement |
-| S80-P07 | Implement atomic rollback and recovery drill | S80-P06 | rollback replay passes |
-| S80-P08 | Implement production readiness report | S80-P07 | all required evidence linked |
+| S80-P06 | Implement Registry alias promotion service | S80-P05, S20-P07 | audited alias movement |
+| S80-P07 | Implement atomic local-bundle rollback and recovery drill | S80-P06 | rollback replay passes without live MLflow dependency |
+| S80-P08 | Implement production readiness report | S80-P07, S20-P12 | all required evidence linked |
 
-## 34. Work-package ownership
-
-Backlog generation uses:
-
-```text
-ARCHITECTURE.md
-    contracts, boundaries and invariants
-
-METHODOLOGY.md
-    algorithms, experiments, metrics and research work packages
-
-OPERATIONS.md
-    MLflow, runtime, promotion and platform work packages
-```
-
-A backlog generator may split a table row only when the row explicitly identifies separable outputs. It may not merge rows from different stacks into one backlog item.
-
-## 35. Production readiness
+## 29. Production readiness
 
 Production activation requires:
 
 ```text
-no-withdrawal credentials
+verified access to http://10.10.1.3:5000
+compatible MLflow client/server versions
+verified tracking, artifact and Registry capabilities
+external PostgreSQL and artifact persistence evidence
+external backup and restore evidence
+approved LAN/VPN exposure and documented HTTP security posture
+complete lineage from dataset to immutable deployment bundle
+locally materialised and hash-verified champion bundle
+no-withdrawal exchange credentials
 secret management
 verified contract semantics
 isolated margin and one-way enforcement
 1x leverage cap
-small-account capability
 idempotency and locking
-persisted state machines
+persisted runtime state machines
 reconciliation
-mark, index, liquidation and funding monitoring
+liquidation and funding monitoring
 tested kill switch
 alerts and runbooks
-dashboards
-backup and recovery
 atomic rollback
 completed paper and canary stages
 named operational owner
-complete MLflow lineage from dataset to champion bundle
 ```
+
+The current existence of the NAS endpoint alone is not production-readiness evidence. It is the starting dependency for the adoption stack.
