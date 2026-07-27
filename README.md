@@ -38,13 +38,72 @@ external BTC-perpetual execution system
 
 Only the regime estimator is learned in Production V1. Strategy experts, allocation, risk enforcement and emergency actions are deterministic and versioned.
 
+## Shared MLflow dependency
+
+The project consumes the shared NAS-hosted MLflow platform maintained in:
+
+```text
+SergejSchweizer/mlflow
+```
+
+The shared platform owns:
+
+```text
+MLflow Tracking Server
+MLflow backend PostgreSQL
+RustFS artifact store
+Caddy ingress
+MLflow authentication
+platform backups, restores and upgrades
+project onboarding and capability qualification
+```
+
+This repository owns:
+
+```text
+MLflow client configuration
+experiment taxonomy and run roles
+dataset lineage and artifact semantics
+project metrics and promotion evidence
+custom model and deployment-bundle packaging
+research, promotion and runtime identity requirements
+```
+
+This repository does not deploy its own MLflow PostgreSQL database or artifact store. Runtime decisions, current probabilities, positions, orders, drawdown, reconciliation and execution state remain outside MLflow.
+
+### Canonical MLflow identity
+
+```text
+project_id = regime-strategy-selector
+experiment_prefix = regime-strategy-selector/
+registered_model_prefix = regime-strategy-selector--
+```
+
+Registered models:
+
+```text
+regime-strategy-selector--regime-estimator
+regime-strategy-selector--deployment-bundle
+```
+
+Protected aliases:
+
+```text
+@challenger
+@shadow
+@champion
+@rollback
+```
+
+Research workers may log runs and artifacts but cannot move protected aliases. A dedicated promotion identity performs authorised registration and alias movement. Runtime resolves immutable model versions or the approved deployment-bundle alias with read-only access.
+
 ## Documentation
 
 The repository deliberately keeps only three detailed documentation files:
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — system design, component boundaries, persistent-state semantics, public contracts and compatibility rules.
 - [`METHODOLOGY.md`](METHODOLOGY.md) — exact formulas, backtest conventions, statistical and economic validation, exit optimisation and research work packages.
-- [`OPERATIONS.md`](OPERATIONS.md) — runtime state machines, security, monitoring, MLflow usage, Model Registry, promotion, rollback and implementation workflow.
+- [`OPERATIONS.md`](OPERATIONS.md) — runtime state machines, security, monitoring, shared MLflow usage, Model Registry governance, promotion, rollback and implementation workflow.
 
 Upstream dataset definitions are maintained in [`crypto-history-loader/DATASETS.md`](https://github.com/SergejSchweizer/crypto-history-loader/blob/main/DATASETS.md).
 
@@ -107,9 +166,23 @@ standalone strategy evidence
 -> learned allocators evaluated separately
 ```
 
+## MLflow run granularity
+
+MLflow records bounded research and deployment episodes, not every hourly runtime decision.
+
+```text
+training parent run = one candidate family x dataset snapshot x outer fold
+child run = one seed, inner fold, parameter combination or cost scenario
+shadow run = one bounded evaluation window
+paper run = one deployment bundle and paper episode
+canary run = one deployment bundle and canary observation window
+```
+
+Individual hourly decisions belong in the runtime audit store and reference the exact immutable MLflow model version and source run.
+
 ## Backlog generation contract
 
-The documentation is written so that a future backlog can be generated without inventing missing scope. A backlog item must reference one stable work package from `METHODOLOGY.md` or `OPERATIONS.md` and contain:
+The documentation is written so that a future backlog can be generated without inventing missing scope. A backlog item references one stable work package from `METHODOLOGY.md` or `OPERATIONS.md` and contains:
 
 ```text
 work_package_id
@@ -135,7 +208,7 @@ S00 Foundations
  |
  +--> S10 Data and point-in-time features
  |      |
- |      +--> S20 MLflow tracking foundation
+ |      +--> S20 Shared MLflow integration
  |      |
  |      +--> S30 Persistent regime estimator
  |      |
@@ -156,7 +229,7 @@ S00 Foundations
  +--> S110 Learned allocators
 ```
 
-`S90`, `S100` and `S110` start only after the Production V1 evidence stack has passed its required gates.
+`S90`, `S100` and `S110` start only after the Production V1 evidence stack passes its required gates.
 
 ## Atomic stacked pull requests
 
@@ -172,16 +245,16 @@ PR title: [S30-P03] Implement multi-seed HMM stability
 
 ### Stack rules
 
-1. One PR implements one work package and one primary behaviour.
-2. A PR starts from the exact accepted parent commit declared in its metadata.
-3. A dependent PR targets its parent branch until the parent merges; it is then rebased onto the new `main` and retargeted.
-4. Every PR is squash-merged so one backlog item produces one deterministic mainline commit.
-5. Contract changes precede implementations that consume them.
-6. Infrastructure, domain behaviour, model research and cleanup are not mixed in one PR.
-7. Refactoring is allowed only when required by the work package and is listed explicitly.
-8. Each PR includes deterministic tests and fixed seeds where randomness exists.
-9. Research PRs log the required MLflow run, dataset digest, parameters, metrics and artifacts before completion.
-10. A child PR cannot merge while its declared parent is unmerged or its compatibility checks fail.
+1. one PR implements one work package and one primary behaviour;
+2. a PR starts from the exact accepted parent commit declared in its metadata;
+3. a dependent PR targets its parent branch until the parent merges, then rebases onto new `main`;
+4. every PR is squash-merged into one deterministic mainline commit;
+5. contract changes precede implementations that consume them;
+6. infrastructure, domain behaviour, model research and cleanup are not mixed;
+7. refactoring is allowed only when required by the work package;
+8. randomness uses fixed recorded seeds;
+9. research PRs log required MLflow evidence before completion;
+10. a child cannot merge while its parent or compatibility checks remain unresolved.
 
 ### Required PR metadata
 
@@ -192,26 +265,11 @@ depends_on:
 base_commit: immutable parent SHA
 contracts_added: []
 contracts_changed: []
-mlflow_experiment: btc-regime/20-regime-model-selection
+mlflow_experiment: regime-strategy-selector/20-regime-model-selection
 deterministic_seeds: [recorded values]
 acceptance_commands: [exact commands]
 artifacts_expected: [exact paths or MLflow artifacts]
 non_goals: [explicit exclusions]
-```
-
-### Atomicity gate
-
-A PR is atomic only when:
-
-```text
-one work package is completed
-all acceptance criteria are machine-checkable
-the diff contains no unrelated changes
-public contracts remain compatible or are versioned
-tests are deterministic
-MLflow evidence is reproducible when required
-rollback or disable behaviour is defined
-documentation references the exact work package
 ```
 
 ## Deployment lifecycle
