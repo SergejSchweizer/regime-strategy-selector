@@ -6,10 +6,7 @@ import pytest
 
 @pytest.mark.integration
 def test_installed_package_is_importable_in_fresh_process() -> None:
-    command = (
-        "import regime_strategy_selector; "
-        "print(regime_strategy_selector.__version__)"
-    )
+    command = "import regime_strategy_selector; print(regime_strategy_selector.__version__)"
     completed = subprocess.run(
         [sys.executable, "-c", command],
         check=True,
